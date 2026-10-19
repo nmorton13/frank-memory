@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "frank-memory",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "observability": { "enabled": true },
+  // Serve only on the custom domain (attach it with `wrangler deploy --domain <host>` or in the dashboard).
+  // workers.dev would bypass Cloudflare Access; the Worker still refuses it for the browser, but one origin is simpler.
+  "workers_dev": false,
+  "preview_urls": false,
+  "durable_objects": {
+    "bindings": [{ "name": "MEMORY_VAULT", "class_name": "MemoryVault" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MemoryVault"] }],
+  "vectorize": [{ "binding": "VECTORIZE", "index_name": "frank-memory-index" }],
+  "ai": { "binding": "AI" },
+  // This KV id belongs to the original deployment. In your own copy, replace it with the id that
+  // `npx wrangler kv namespace create OAUTH_KV` prints (it only works with that account's credentials).
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "09cead978cf34cff9d477a61fab6e1d2" }]
+  // Per-deployment settings are Worker secrets, not committed here (npx wrangler secret put <NAME>):
+  //   PUBLIC_URL             canonical origin, e.g. https://memory.example.com (OAuth issuer + MCP resource id);
+  //                          defaults to the origin each request arrives on
+  //   ACCESS_TEAM_DOMAIN, ACCESS_AUD, ACCESS_ALLOWED_EMAILS   required: Cloudflare Access is the only sign-in (see README)
+  //   ACCESS_SERVICE_TOKENS  optional Access service-token client IDs that scripts (backups) may use on /api/*
+  //   DEV_OWNER_EMAIL        local dev only (.dev.vars): sign localhost requests in as this owner
+  //   MCP_ALLOWED_HOSTNAMES  optional extra hostnames for /mcp (comma list)
+  // Attach a custom domain in the dashboard (Worker > Settings > Domains & Routes).
+}

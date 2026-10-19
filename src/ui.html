@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>frank-memory</title>
+<style>
+  :root { --b:#e5e7eb; --m:#6b7280; --a:#2563eb; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.45 system-ui, -apple-system, sans-serif; margin: 0; color: #111827; background: #fafafa; }
+  header { display:flex; align-items:center; gap:1rem; padding:.8rem 1.5rem; background:#fff; border-bottom:1px solid var(--b); position:sticky; top:0; z-index:2 }
+  header h1 { font-size:1.1rem; margin:0 } header .sp { flex:1 }
+  main { max-width: 1000px; margin: 0 auto; padding: 1rem 1.5rem 4rem; }
+  section { background:#fff; border:1px solid var(--b); border-radius:10px; padding:1rem 1.2rem; margin:1rem 0 }
+  h2 { font-size:1rem; margin:0 0 .6rem; display:flex; gap:.5rem; align-items:center }
+  textarea, input, select { font: inherit; border:1px solid var(--b); border-radius:6px; padding:.4rem .5rem; }
+  textarea { width:100%; }
+  button { font: inherit; border:1px solid var(--b); background:#fff; border-radius:6px; padding:.35rem .7rem; cursor:pointer }
+  button.p { background:var(--a); color:#fff; border-color:var(--a) } button.d { color:#b91c1c }
+  .row { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap }
+  .mem { border-top:1px solid var(--b); padding:.6rem 0 } .mem:first-child { border-top:0 }
+  .meta { color:var(--m); font-size:12px } .pill { font-size:11px; padding:1px 7px; border-radius:99px; background:#eef2ff; color:#3730a3 }
+  .st-proposed { background:#fef3c7; color:#92400e } .st-superseded,.st-rejected { background:#f3f4f6; color:#6b7280 }
+  .muted { color:var(--m) } details summary { cursor:pointer }
+  .sim { margin:.35rem 0 0 .2rem; padding:.35rem .6rem; border-left:3px solid #f59e0b; background:#fffbeb; font-size:13px }
+  .toast { position:fixed; bottom:1rem; right:1rem; background:#111827; color:#fff; padding:.5rem .8rem; border-radius:6px; display:none }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧠 frank-memory</h1><span class="sp"></span>
+  <span id="counts" class="meta"></span>
+  <label class="row">Approval
+    <select id="mode"><option value="review">review</option><option value="auto">auto</option></select></label>
+  <button onclick="exp('md')">Export MD</button><button onclick="exp('json')">Export JSON</button>
+  <a href="/cdn-cgi/access/logout"><button title="Sign out of Cloudflare Access in this browser">Sign out</button></a>
+</header>
+<main>
+  <section>
+    <h2>Pending approval <span id="pcount" class="pill st-proposed"></span></h2>
+    <div id="pending" class="muted">Loading…</div>
+  </section>
+
+  <section>
+    <h2>Memories</h2>
+    <div class="row">
+      <input id="q" placeholder="Search (hybrid recall)…" style="flex:1;min-width:220px">
+      <select id="ftype"><option value="">all types</option></select>
+      <select id="fstatus"><option value="">active+proposed</option><option>active</option><option>proposed</option><option>superseded</option><option>rejected</option></select>
+      <button onclick="loadList()">Search</button>
+    </div>
+    <details style="margin:.6rem 0"><summary>Add a memory</summary>
+      <div class="row" style="margin-top:.4rem"><textarea id="newc" rows="2" placeholder="One standalone fact…"></textarea>
+      <select id="newt"></select><button class="p" onclick="addOne()">Add (active)</button></div></details>
+    <div id="list"></div>
+  </section>
+
+  <section>
+    <h2>Import</h2>
+    <textarea id="paste" rows="6" placeholder="Paste markdown / plain text / JSON array. Split on '---', blank lines, or bullet lines."></textarea>
+    <div class="row" style="margin-top:.4rem"><input id="psrc" placeholder="source (e.g. ChatGPT memories)"><button class="p" onclick="bulk()">Import</button><span id="pres" class="meta"></span></div>
+    <h2 style="margin-top:1rem">Batches</h2><div id="batches" class="muted"></div>
+  </section>
+
+  <section>
+    <h2>Connected apps</h2>
+    <p class="meta" style="margin-top:0">Apps connected with OAuth. Revoke one to cut it off.</p>
+    <div id="apps" class="muted">Loading…</div>
+  </section>
+
+  <section>
+    <h2>History</h2>
+    <p class="meta" style="margin-top:0">A daily cleanup removes old history. Active and pending memories are never removed. Expired rejected items keep a fingerprint so the same text isn't re-imported. Use 0 to keep forever.</p>
+    <div class="row">
+      <label>Replaced memories <input id="r_superseded_days" type="number" min="0" max="3650" style="width:6em"> days</label>
+      <label>Rejected <input id="r_rejected_days" type="number" min="0" max="3650" style="width:6em"> days</label>
+      <label>Activity log <input id="r_audit_days" type="number" min="0" max="3650" style="width:6em"> days</label>
+      <button class="p" onclick="saveRetention()">Save</button><button onclick="cleanupNow()">Clean up now</button>
+    </div>
+    <div id="lastclean" class="meta" style="margin-top:.4rem"></div>
+    <div class="row" style="margin-top:.6rem"><span id="indexstatus" class="meta" style="flex:1"></span><button onclick="rebuildIndex()">Rebuild search index</button></div>
+  </section>
+
+  <section>
+    <h2>Backup</h2>
+    <p class="meta" style="margin-top:0">A backup holds the whole vault: every memory with its history and ids, forgotten-text fingerprints, import batches, the guide and its versions, settings, and the activity log. Keep copies somewhere other than Cloudflare. Export MD/JSON above is for reading, not restoring. Connected apps are not in the backup; reconnect them after restoring to a new deployment.</p>
+    <div class="row">
+      <button class="p" onclick="location.href='/api/backup'">Download backup</button>
+      <label>Restore from file <input id="restorefile" type="file" accept="application/json,.json" onchange="restoreBackup(this)"></label>
+    </div>
+  </section>
+
+  <section>
+    <h2>Operating Guide <span id="gver" class="pill"></span></h2>
+    <textarea id="guide" rows="18" style="font-family:ui-monospace,monospace;font-size:12.5px"></textarea>
+    <div class="row" style="margin-top:.4rem"><button class="p" onclick="saveGuide()">Save new version</button><button onclick="loadDefaultGuide()" title="Put the guide that ships with the deployed code into the editor. Nothing is saved until you click Save.">Load latest default</button><span id="gmeta" class="meta"></span></div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+<script>
+const TYPES = ["fact","preference","decision","note","project"];
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = (s) => s ? new Date(s).toLocaleString() : "";
+function toast(t) { const e = $("toast"); e.textContent = t; e.style.display = "block"; setTimeout(() => e.style.display = "none", 2500); }
+async function call(path, method, body) {
+  const r = await fetch("/api" + path, { method: method || "GET", headers: body ? {"content-type":"application/json"} : {}, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin" });
+  // 401, or an Access login redirect after the Access session expired: reload to sign in again.
+  if (r.status === 401 || r.redirected || !(r.headers.get("content-type") || "").includes("json")) { location.reload(); throw new Error("unauthorized"); }
+  const j = await r.json(); if (j && j.ok === false) toast(j.error || "Error"); return j;
+}
+TYPES.forEach((t) => { $("ftype").add(new Option(t, t)); $("newt").add(new Option(t, t)); });
+$("newt").value = "fact";
+
+function memHtml(m, pending) {
+  const meta = [m.source && ("source: " + esc(m.source)), m.source_date && ("source date: " + esc(m.source_date)),
+    "added " + fmt(m.created_at), m.updated_at !== m.created_at && ("updated " + fmt(m.updated_at)),
+    m.confirmed_at && ("confirmed " + fmt(m.confirmed_at)), m.batch_id && ("batch " + esc(m.batch_id)),
+    m.supersedes && ("supersedes " + esc(m.supersedes)), m.score != null && ("score " + m.score + " [" + m.matched.join("+") + "]")].filter(Boolean).join(" · ");
+  return '<div class="mem" data-id="' + esc(m.id) + '">' +
+    '<div class="row"><span class="pill">' + esc(m.type) + '</span><span class="pill st-' + esc(m.status) + '">' + esc(m.status) + '</span>' +
+    '<span class="c" style="flex:1">' + esc(m.content) + '</span></div>' +
+    (m.similar_to && m.status === "proposed" ? '<div class="sim">Similar to an existing memory' + (m.similar_content == null ? ' (since removed)' : ': ' + esc(m.similar_content)) + '</div>' : '') +
+    (m.similar_to && m.status === "active" && m.similar_status === "active" ? '<div class="sim">May conflict with: ' + esc(m.similar_content) + '</div>' : '') +
+    '<div class="row" style="margin-top:.25rem"><span class="meta" style="flex:1">' + meta + '</span>' +
+    (pending || m.status === "proposed" ? '<button class="p" onclick="act(\'' + m.id + '\',\'approve\')">Approve</button>' +
+      (m.similar_to && m.similar_content != null ? '<button class="p" title="Approve this and mark the similar memory superseded" onclick="act(\'' + m.id + '\',\'approve\',1)">Approve &amp; replace old</button>' : '') +
+      '<button onclick="act(\'' + m.id + '\',\'reject\')">Reject</button>' : '') +
+    '<button onclick="edit(\'' + m.id + '\')">Edit</button><button class="d" onclick="del(\'' + m.id + '\')">Delete</button>' +
+    '<button class="d" title="Delete and block re-import" onclick="forget(\'' + m.id + '\')">Forget</button></div></div>';
+}
+const cache = {};
+function render(el, rows, pending) { rows.forEach((m) => cache[m.id] = m); $(el).innerHTML = rows.length ? rows.map((m) => memHtml(m, pending)).join("") : '<span class="muted">Nothing here.</span>'; }
+
+async function loadSettings() {
+  const s = await call("/settings"); $("mode").value = s.approval_mode;
+  for (const k of ["superseded_days", "rejected_days", "audit_days"]) $("r_" + k).value = s.retention[k];
+  const c = s.last_cleanup;
+  $("lastclean").textContent = c ? "Last cleanup " + fmt(c.at) + ": removed " + c.superseded + " replaced, " + c.rejected + " rejected, " + c.audit + " log entries" : "No cleanup has run yet.";
+  $("counts").textContent = Object.entries(s.counts).map(([k, v]) => v + " " + k).join(" · ");
+  const ix = s.index;
+  $("indexstatus").textContent = !ix || !ix.pending ? "Search index is up to date."
+    : "Search index: " + ix.pending + " waiting" + (ix.failing ? ", " + ix.failing + " failing (" + ix.last_error + "), next retry " + fmt(ix.next_retry) : "") + ". Keyword search covers them meanwhile.";
+}
+async function loadPending() { const r = await call("/memories?status=proposed&limit=200"); $("pcount").textContent = r.total; render("pending", r.memories, true); }
+async function loadList() {
+  const q = $("q").value.trim(), t = $("ftype").value, s = $("fstatus").value;
+  if (q) {
+    const r = await call("/recall?q=" + encodeURIComponent(q) + "&type=" + t + "&status=" + s + "&limit=30");
+    render("list", r.results); if (r.mode !== "hybrid") toast("Search mode: " + r.mode);
+  } else {
+    const r = await call("/memories?limit=200&type=" + t + "&status=" + s);
+    render("list", s ? r.memories : r.memories.filter((m) => m.status === "active" || m.status === "proposed"));
+  }
+}
+async function loadBatches() {
+  const b = await call("/batches");
+  $("batches").innerHTML = b.length ? b.map((x) => '<div class="row mem"><span style="flex:1">' + esc(x.id) + ' · ' + esc(x.source || "") + ' · ' + x.added + ' added, ' + x.remaining + ' remaining · ' + fmt(x.created_at) + (x.undone_at ? ' · undone' : '') + '</span>' +
+    (x.remaining > 0 ? '<button class="d" onclick="undo(\'' + x.id + '\')">Undo batch</button>' : '') + '</div>').join("") : "No imports yet.";
+}
+async function loadApps() {
+  const a = await call("/oauth/grants");
+  $("apps").innerHTML = a.length ? a.map((g) => '<div class="row mem"><span style="flex:1"><b>' + esc(g.client_name) + '</b> <span class="meta">· ' + esc(g.redirect_uri ? new URL(g.redirect_uri).host || g.redirect_uri : "") +
+    ' · connected ' + fmt(g.created_at) + (g.scope && g.scope.length ? ' · ' + esc(g.scope.join(" ")) : '') + ' · ' + esc(g.client_id) + '</span></span>' +
+    '<button class="d" onclick="revokeApp(\'' + esc(g.grant_id) + '\')">Revoke</button></div>').join("") : "No connected apps.";
+}
+async function revokeApp(id) { if (confirm("Revoke this app's access? It will need to sign in again.")) { await call("/oauth/grants/" + encodeURIComponent(id) , "DELETE"); toast("Revoked"); loadApps(); } }
+async function loadGuide() { const g = await call("/guide"); $("guide").value = g.content; $("gver").textContent = "v" + g.version; $("gmeta").textContent = "updated " + fmt(g.updated_at) + " · " + g.history.length + " versions" + (g.newer_default ? " · a newer default guide is available: click Load latest default to review it" : ""); }
+async function refresh() { await Promise.all([loadSettings(), loadPending(), loadList(), loadBatches()]); }
+
+async function act(id, a, replace) { const r = await call("/memories/" + id + "/" + a + (replace ? "?supersede_similar=1" : ""), "POST"); if (r.ok) toast(replace ? "Approved; old memory superseded" : a + "d"); refresh(); }
+async function del(id) { if (confirm("Delete this memory?")) { await call("/memories/" + id, "DELETE"); refresh(); } }
+async function forget(id) { if (confirm("Forget permanently and block re-import?")) { await call("/memories/" + id + "/forget", "POST"); refresh(); } }
+async function undo(id) { if (confirm("Remove every memory from this batch?")) { const r = await call("/batches/" + id + "/undo", "POST"); toast("Removed " + r.removed + (r.restored ? ", restored " + r.restored + " it had replaced" : "")); refresh(); } }
+function edit(id) {
+  const m = cache[id], el = document.querySelector('[data-id="' + id + '"] .c');
+  el.innerHTML = '<textarea rows="3"></textarea><div class="row"><select></select><button class="p">Save</button><button>Cancel</button></div>';
+  const ta = el.querySelector("textarea"), sel = el.querySelector("select"), [save, cancel] = el.querySelectorAll("button");
+  ta.value = m.content; TYPES.forEach((t) => sel.add(new Option(t, t))); sel.value = m.type;
+  cancel.onclick = refresh;
+  save.onclick = async () => { const r = await call("/memories/" + id, "PATCH", { content: ta.value, type: sel.value }); if (r.ok) { toast(r.warning || "Saved & re-embedded"); refresh(); } };
+}
+async function addOne() { const r = await call("/memories", "POST", { content: $("newc").value, type: $("newt").value, status: "active", source: "ui" }); if (r.ok) { $("newc").value = ""; toast(r.duplicate ? "Already exists" : "Added"); refresh(); } }
+async function bulk() {
+  const r = await call("/bulk", "POST", { text: $("paste").value, source: $("psrc").value || "ui paste" });
+  if (r.ok) { $("pres").textContent = r.active + " added, " + (r.possible_conflicts ? r.possible_conflicts + " flagged as possible conflicts, " : r.needs_review + " sent to review (similar to existing), ") + r.near_duplicates + " near-duplicates skipped, " + r.duplicates + " exact duplicates, " + r.excluded + " excluded, " + r.secrets_skipped + " secret-like skipped" + (r.dedupe_warning || r.warning ? " (" + (r.dedupe_warning || r.warning) + ")" : ""); $("paste").value = ""; refresh(); }
+}
+async function loadDefaultGuide() {
+  const d = await call("/guide/default");
+  if (d.content === $("guide").value) { toast("Your guide already matches the latest default"); return; }
+  if (!confirm("Replace the editor contents with the latest default guide? Your saved guide isn't changed until you click Save new version.")) return;
+  $("guide").value = d.content; toast("Loaded latest default; review it, then Save new version");
+}
+async function saveGuide() { const r = await call("/guide", "PUT", { content: $("guide").value }); if (r.ok) { toast("Guide v" + r.version); loadGuide(); } }
+async function saveRetention() {
+  const retention = {}; for (const k of ["superseded_days", "rejected_days", "audit_days"]) retention[k] = $("r_" + k).value;
+  const r = await call("/settings", "PUT", { retention }); if (r.ok) { toast("History settings saved"); loadSettings(); }
+}
+async function cleanupNow() {
+  if (!confirm("Remove history older than these periods now?")) return;
+  const r = await call("/cleanup", "POST"); if (r.ok) { toast("Removed " + r.superseded + " replaced, " + r.rejected + " rejected, " + r.audit + " log entries"); refresh(); }
+}
+async function restoreBackup(input) {
+  const f = input.files[0]; input.value = ""; if (!f) return;
+  let data; try { data = JSON.parse(await f.text()); } catch { toast("That file isn't JSON."); return; }
+  if (!confirm("Restore " + (data.memories ? data.memories.length : "?") + " memories from the backup made " + (data.exported_at ? fmt(data.exported_at) : "(unknown date)") + "?")) return;
+  let r = await call("/restore", "POST", data);
+  if (r.not_empty) {
+    if (!confirm("This REPLACES everything in this vault with the backup: memories, history, guide and settings. Download a backup of the current vault first if you might need it. Replace now?")) return;
+    r = await call("/restore?replace=1", "POST", data);
+  }
+  if (r.ok) { toast("Restored " + r.restored.memories + " memories" + (r.reembed ? "; re-embedding " + r.reembed : "") + ". Search index rebuilding."); refresh(); }
+}
+async function rebuildIndex() {
+  if (!confirm("Re-send every memory to the search index? It runs in the background.")) return;
+  const r = await call("/reindex", "POST"); if (r.ok) { toast("Queued " + r.queued + " memories"); refresh(); }
+}
+function exp(f) { location.href = "/api/export?format=" + f; }
+$("mode").onchange = async (e) => { await call("/settings", "PUT", { approval_mode: e.target.value }); toast("Approval mode: " + e.target.value); };
+$("q").onkeydown = (e) => { if (e.key === "Enter") loadList(); };
+$("ftype").onchange = $("fstatus").onchange = loadList;
+refresh(); loadGuide(); loadApps();
+</script>
+</body>
+</html>

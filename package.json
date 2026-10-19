@@ -1,0 +1,29 @@
+{
+  "name": "frank-memory",
+  "version": "1.0.0",
+  "description": "Self-hosted shared memory vault for AI agents (Cloudflare Worker + Durable Object + Vectorize + MCP)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "author": "Nathan Morton",
+  "license": "MIT",
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.2.3",
+    "@modelcontextprotocol/server": "2.3.1",
+    "agents": "^0.28.1",
+    "jose": "6.2.12",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261013.1",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.4",
+    "wrangler": "^4.150.0"
+  },
+  "private": true,
+  "type": "module"
+}
