@@ -1071,7 +1071,8 @@ export class MemoryVault extends DurableObject<Env> {
    * Hybrid search, with hits in the question's area ranked higher. The area is `input.area`, else the one area
    * the query names. With `complete` (agent recall), the results also hold that whole area (within
    * AREA_ALL_BUDGET_TOKENS) and all general memories (within GENERAL_ALL_BUDGET_TOKENS, else just the general
-   * preferences); the result's `complete` lists which were included ("general" or "general preferences").
+   * preferences, or as many of those as fit); `complete` lists what was included in full ("general" or "general
+   * preferences") and `partial` what was cut to fit.
    */
   async recall(input: { query: string; limit?: number; type?: string; status?: string; area?: string; complete?: boolean }) {
     const areas = this.areaDefs();
@@ -1098,16 +1099,41 @@ export class MemoryVault extends DurableObject<Env> {
         if (prefs?.length) add(`${area} preferences`, prefs);
       }
     }
+    const partial: string[] = [];
     const general = this.wholeArea(input, null, GENERAL_ALL_BUDGET_TOKENS);
     if (general || input.type) add("general", general);
-    else add("general preferences", this.wholeArea({ ...input, type: "preference" }, null, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES));
-    return { mode: found.mode, ...("judged" in found ? { judged: true } : {}), ...(area ? { area } : {}), complete, results };
+    else {
+      const prefs = this.wholeArea({ ...input, type: "preference" }, null, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES);
+      if (prefs) add("general preferences", prefs);
+      else {
+        // Too many to load in full: never none, but as many as fit, confirmed ones first, then the newest.
+        const some = this.preferencesThatFit(input, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES);
+        for (const m of some.rows) if (!seen.has(m.id)) { seen.add(m.id); results.push(m); }
+        partial.push(`general preferences: ${some.rows.length} of ${some.total} (confirmed first, then newest)`);
+      }
+    }
+    return { mode: found.mode, ...("judged" in found ? { judged: true } : {}), ...(area ? { area } : {}), complete, ...(partial.length ? { partial } : {}), results };
   }
 
   /**
    * Every memory recall may return from one area (null = general), grouped by type and newest first,
    * or null if there are more than `maxRows` or they don't fit in `budgetTokens`.
    */
+  /** The general preferences that fit `budgetTokens` and `maxRows`: owner-confirmed first, then newest. */
+  private preferencesThatFit(input: { status?: string }, budgetTokens: number, maxRows: number): { rows: Memory[]; total: number } {
+    const w = `${input.status ? "status = ?" : "status IN ('active','proposed')"} AND area IS NULL AND type = 'preference'`;
+    const args: unknown[] = input.status ? [input.status] : [];
+    const total = Number(this.sql.exec(`SELECT COUNT(*) AS c FROM memories WHERE ${w}`, ...args).one().c);
+    const rows: Memory[] = [];
+    let used = 0;
+    for (const m of this.sql.exec(`SELECT ${COLS} FROM memories WHERE ${w} ORDER BY (confirmed_at IS NULL), updated_at DESC LIMIT ?`, ...args, maxRows).toArray() as unknown as Memory[]) {
+      used += JSON.stringify(slimMemory(m)).length;
+      if (used > budgetTokens * 4) break;
+      rows.push(m);
+    }
+    return { rows, total };
+  }
+
   private wholeArea(input: { type?: string; status?: string }, area: string | null, budgetTokens: number, maxRows = AREA_ALL_MAX_MEMORIES): Memory[] | null {
     const where = [input.status ? "status = ?" : "status IN ('active','proposed')", area ? "area = ?" : "area IS NULL"];
     const args: unknown[] = input.status ? [input.status] : [];

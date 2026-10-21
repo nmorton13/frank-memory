@@ -210,6 +210,23 @@ describe("areas", () => {
     expect(res.results.map((r) => r.id)).toEqual(expect.arrayContaining(prefs));
   });
 
+  it("loads as many general preferences as fit when there are too many, confirmed ones first", async () => {
+    const h = createVault({ approvalMode: "auto" });
+    const confirmed = await h.vault.remember({ content: "Sam prefers rule zero: confirmed by Sam", type: "preference", ...ui });
+    const later = [];
+    for (let i = 1; i <= 44; i++) later.push((await h.vault.remember({ content: `Sam prefers rule ${i}`, type: "preference" })).id);
+    // Distinct update times, oldest first, so "newest" is well defined.
+    later.forEach((id, i) => h.db.prepare(`UPDATE memories SET updated_at = ? WHERE id = ?`).run(new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), id));
+    h.db.prepare(`UPDATE memories SET updated_at = ? WHERE id = ?`).run("2025-01-01T00:00:00.000Z", confirmed.id);
+    const res = await h.vault.recall({ query: "what does Sam prefer", complete: true });
+    expect(res).toMatchObject({ partial: ["general preferences: 40 of 45 (confirmed first, then newest)"] });
+    expect((res as { complete: string[] }).complete).not.toContain("general preferences");
+    const ids = res.results.map((r) => r.id);
+    expect(ids).toContain(confirmed.id);
+    expect(ids).toEqual(expect.arrayContaining(later.slice(-39)));
+    expect(ids).not.toContain(later[0]);
+  });
+
   it("gives the general preferences larger limits than a whole area", async () => {
     const h = createVault();
     const prefs = [];
