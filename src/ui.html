@@ -126,7 +126,7 @@ function memHtml(m, pending) {
     "added " + fmt(m.created_at), m.updated_at !== m.created_at && ("updated " + fmt(m.updated_at)),
     m.confirmed_at && ("confirmed " + fmt(m.confirmed_at)), m.batch_id && ("batch " + esc(m.batch_id)),
     m.supersedes && ("supersedes " + esc(m.supersedes)), m.score != null && ("score " + m.score + " [" + m.matched.join("+") + "]")].filter(Boolean).join(" · ");
-  const by = { owner: "set by you", agent: "chosen by an agent", inherited: "from the memory it replaced", source: "from its source repo", content: "named in its text", model: "labeled in the background" }[m.area_source] || "not labeled yet";
+  const by = { owner: "set by you", agent: "chosen by an agent", inherited: "from the memory it replaced", source: "from its source repo", model: "labeled in the background" }[m.area_source] || "not labeled yet";
   return '<div class="mem" data-id="' + esc(m.id) + '">' +
     '<div class="row"><span class="pill">' + esc(m.type) + '</span><span class="pill st-' + esc(m.status) + '">' + esc(m.status) + '</span>' +
     '<span class="pill area' + (m.area ? '' : ' general') + '" title="Area: ' + esc(m.area || "general") + ' (' + by + '). Click to change." onclick="pickArea(\'' + m.id + '\')">' + esc(m.area || "general") + '</span>' +
@@ -198,6 +198,7 @@ function runLabel(run) {
   if (run === "backfill") return "First labeling of existing memories";
   if (run === "restore") return "Labeling after a restore";
   if (run.startsWith("background-")) return "Background labeling";
+  if (run === "relabel-named") return "Relabeling memories that only named an area";
   if (run.startsWith("remove-")) return "Relabeling after removing " + run.slice(7);
   if (run.startsWith("unblock-")) return "Relabeling after allowing " + run.slice(8) + " again";
   if (run.startsWith("batch_")) return "Import " + run;

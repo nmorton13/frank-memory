@@ -37,8 +37,7 @@ Each memory can belong to one **area**: a project or product (a repo, an app, a 
 1. The agent passed `area` (optional; it sticks).
 2. It replaces a memory that had an area (it inherits it).
 3. Its `source` names a repo (`cursor: repo my-app`) that is an area.
-4. Its text names exactly one area or alias.
-5. Otherwise a background job (on the Durable Object alarm) asks Workers AI (`AREA_MODEL`, Mistral Small 3.1) which area it is about. An answer naming an existing area is checked with a second yes/no question before it is used. A new name counts toward creating that area.
+4. Otherwise a background job (on the Durable Object alarm) asks Workers AI (`AREA_MODEL`, Mistral Small 3.1) which area it is about. An answer naming an existing area is checked with a second yes/no question before it is used. A new name counts toward creating that area.
 
 **New areas** are created once 3 memories point to the same name (a repo name or the model's suggestion), and the model writes a one-line description. Generic names ("project", "work", "personal") are refused, and suggestions that contain an area's name (`my-app-blog`) become aliases. **Preferences** only join an existing area, after a check that they apply only there, because a general preference filed under one project would stop loading elsewhere. When unsure, a memory stays general.
 

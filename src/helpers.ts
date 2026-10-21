@@ -140,7 +140,7 @@ export const GENERAL_ALL_BUDGET_TOKENS = 6_000;
 /** An area is created once this many memories point to the same name. */
 export const AREA_MIN_MEMORIES = 3;
 
-export type AreaSource = "agent" | "inherited" | "source" | "content";
+export type AreaSource = "agent" | "inherited" | "source";
 export interface AreaDef { name: string; aliases: string[] }
 
 /** Canonical area name: lowercase words joined by "-", without a domain suffix ("LFKai.town" -> "lfkai"). Null for none. */
@@ -180,9 +180,10 @@ export function resolveArea(name: string, areas: AreaDef[]): string | null {
 
 /**
  * Which area a memory belongs to, by rule: the agent's choice, else the area of the memory it replaces, else the
- * repo in its source, else the one area its content names. Anything else stays general (area null); `hint` is a
- * name that isn't an area yet, counted toward creating one. Preferences are only labeled by an agent or by
- * inheritance: a general preference pinned to one project would rank lower everywhere else.
+ * repo in its source. Anything else stays general (area null) for the model to label; `hint` is a name that isn't
+ * an area yet, counted toward creating one. Preferences are only labeled by an agent or by inheritance: a general
+ * preference pinned to one project would rank lower everywhere else. An area named in the text is not a rule: on the
+ * live vault it put "lives in Lawrence" into LFKai, so naming goes through the model and its yes/no check instead.
  */
 export function pickArea(
   m: { content: string; type: string; source?: string | null },
@@ -198,8 +199,6 @@ export function pickArea(
   // Its repo still counts toward creating that area.
   if (m.type === "preference") return { area: null, source: null, hint: fromRepo ? null : repo };
   if (fromRepo) return { area: fromRepo, source: "source", hint: null };
-  const named = areasNamedIn(m.content, areas);
-  if (named.length === 1) return { area: named[0], source: "content", hint: null };
   return { area: null, source: null, hint: repo };
 }
 

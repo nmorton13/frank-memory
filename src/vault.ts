@@ -156,6 +156,12 @@ export class MemoryVault extends DurableObject<Env> {
       this.sql.exec(`INSERT INTO guide_history(version, content, updated_at, actor) VALUES (1, ?, ?, 'system')`, guide, t);
     }
     if (addAreas) this.relabelAreas("backfill");
+    // v8: labels from an area named in the text are no longer a rule; those memories go to the model instead.
+    const named = this.sql.exec(`SELECT id FROM memories WHERE area_source = 'content'`).toArray();
+    if (named.length) {
+      for (const r of named) this.writeArea(r.id as string, null, null, null);
+      this.relabelAreas("relabel-named");
+    }
   }
 
   // ---------- areas ----------
@@ -235,8 +241,7 @@ export class MemoryVault extends DurableObject<Env> {
       this.audit("area_created", null, "system", { name: r.name, run });
     }
     const areas = this.areaDefs();
-    // A new area can make a memory name two areas, so labels from content are checked again too.
-    for (const r of this.sql.exec(`SELECT id FROM memories WHERE area IS NULL OR area_source = 'content'`).toArray())
+    for (const r of this.sql.exec(`SELECT id FROM memories WHERE area IS NULL`).toArray())
       this.labelArea(r.id as string, { areas, run });
   }
 

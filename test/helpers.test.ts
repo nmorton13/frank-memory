@@ -280,7 +280,7 @@ describe("areas", () => {
     const note = (content: string, source?: string) => ({ content, type: "note", source });
     expect(pickArea(note("x", "repo lfkai"), {}, areas)).toEqual({ area: "lfkai", source: "source", hint: null });
     expect(pickArea(note("x", "repo newthing"), {}, areas)).toEqual({ area: null, source: null, hint: "newthing" });
-    expect(pickArea(note("the LFKai domain"), {}, areas)).toEqual({ area: "lfkai", source: "content", hint: null });
+    expect(pickArea(note("the LFKai domain"), {}, areas)).toEqual({ area: null, source: null, hint: null });
     expect(pickArea(note("LFKai uses frank-memory"), {}, areas).area).toBeNull();
     expect(pickArea(note("x", "repo lfkai"), { explicit: "Garden" }, areas)).toEqual({ area: null, source: "agent", hint: "garden" });
     expect(pickArea(note("x"), { inherited: "lfkai" }, areas)).toEqual({ area: "lfkai", source: "inherited", hint: null });

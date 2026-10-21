@@ -131,12 +131,11 @@ describe("areas", () => {
     expect((await h.vault.listAreas()).map((x) => x.name)).toEqual(["alpha-site"]);
   });
 
-  it("labels memories that name an area, from any source, and leaves ambiguous ones general", async () => {
+  it("leaves a memory that only names an area for the model to judge", async () => {
     const { h } = await twoAreas();
     const named = await h.vault.remember({ content: "Alpha Site launches in May", source: "claude chat", ...ui });
-    const both = await h.vault.remember({ content: "alpha-site and beta share one domain", source: "claude chat", ...ui });
-    expect(named).toMatchObject({ area: "alpha-site" });
-    expect(areaOf(h, both.id as string)).toBeNull();
+    expect(areaOf(h, named.id as string)).toBeNull();
+    expect(h.areaJobs().map((j) => j.memory_id)).toContain(named.id);
   });
 
   it("never labels a preference by rule, but an agent can, and a replacement inherits its area", async () => {
@@ -359,12 +358,14 @@ describe("background area labeling", () => {
     expect(await h.vault.listAreas()).toEqual([]);
   });
 
-  it("checks content labels again when a new area makes a memory name two areas", async () => {
+  it("sends memories labeled by the old text-naming rule to the model on startup", async () => {
     const h = await withAlpha();
-    const both = await h.vault.remember({ content: "the beta router hosts the alpha-site preview", ...ui });
-    expect(areaOf(h, both.id as string)).toBe("alpha-site");
-    for (const c of ["one", "two", "three"]) await h.vault.remember({ content: `beta note ${c}`, source: "repo beta", ...ui });
-    expect(areaOf(h, both.id as string)).toBeNull();
+    const m = await h.vault.remember({ content: "the alpha-site banner is teal", ...ui });
+    h.db.prepare(`UPDATE memories SET area = 'alpha-site', area_source = 'content' WHERE id = ?`).run(m.id as string);
+    h.db.prepare(`DELETE FROM area_jobs`).run();
+    const again = createVault({ db: h.db });
+    expect(areaOf(again, m.id as string)).toBeNull();
+    expect(again.areaJobs().map((j) => j.memory_id)).toContain(m.id);
   });
 
   it("infers the question's area from its best matches", async () => {
