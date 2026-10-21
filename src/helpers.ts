@@ -121,6 +121,88 @@ export const KEYWORD_WEIGHT = 0.25;
 /** Tie-breakers only: much smaller than the gap between a strong and a weak match. */
 const ACTIVE_BONUS = 0.02, RECENCY_BONUS = 0.01, OTHER_STATUS_PENALTY = 0.05;
 
+/** Score bonus for a hit in the question's area: reorders close matches, can't lift a weak match over a strong one. */
+export const AREA_BONUS = 0.1;
+/** Order memory types are grouped in when whole areas are returned (and in the Markdown export). */
+export const TYPE_ORDER = ["fact", "preference", "decision", "project", "note"];
+
+// ---------- areas ----------
+/**
+ * Agent recall returns the question's whole area while it fits this many tokens of slim records (about 4 chars
+ * each), because reading everything beat search on a small vault.
+ */
+export const AREA_ALL_BUDGET_TOKENS = 4_000;
+/**
+ * General memories (about the owner, how to work with them) matter for every question, so they get a larger budget.
+ * Over it, recall returns the general preferences in full and finds other general memories by search.
+ */
+export const GENERAL_ALL_BUDGET_TOKENS = 6_000;
+/** An area is created once this many memories point to the same name. */
+export const AREA_MIN_MEMORIES = 3;
+
+export type AreaSource = "agent" | "inherited" | "source" | "content";
+export interface AreaDef { name: string; aliases: string[] }
+
+/** Canonical area name: lowercase words joined by "-", without a domain suffix ("LFKai.town" -> "lfkai"). Null for none. */
+export function normalizeArea(s: string | null | undefined): string | null {
+  if (typeof s !== "string") return null;
+  const n = s.toLowerCase().trim()
+    .replace(/\.(com|net|org|io|ai|app|dev|town|co|xyz)$/, "")
+    .replace(/[\s_.]+/g, "-").replace(/[^a-z0-9-]/g, "").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return n && n.length <= 40 && !GENERIC_AREA_NAMES.has(n) ? n : null;
+}
+/** Words that name no particular area; a model or agent suggesting one is treated as "general". */
+const GENERIC_AREA_NAMES = new Set(["general", "none", "unknown", "other", "misc", "personal", "life", "work", "home", "project",
+  "the-project", "projects", "technology", "tech", "software", "code", "ai", "notes", "memory", "preferences"]);
+
+/** The repo named in a source such as "cursor: repo frank-memory (via Cursor)", normalized. */
+export function repoFromSource(source: string | null | undefined): string | null {
+  return normalizeArea(source?.match(/\brepo[:\s]+([\w.-]+)/i)?.[1]);
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Areas whose name or an alias appears in the text as a whole word; "frank-memory" also matches "frank memory". */
+export function areasNamedIn(text: string, areas: AreaDef[]): string[] {
+  const found: string[] = [];
+  for (const a of areas) {
+    const terms = [a.name, ...a.aliases].filter((t) => t.length >= 3);
+    if (terms.some((t) => new RegExp(`(?<![a-z0-9])${t.split("-").map(escapeRe).join("[-\\s]?")}(?![a-z0-9])`, "i").test(text)))
+      found.push(a.name);
+  }
+  return found;
+}
+
+/** The area a normalized name or alias refers to. */
+export function resolveArea(name: string, areas: AreaDef[]): string | null {
+  return areas.find((a) => a.name === name || a.aliases.includes(name))?.name ?? null;
+}
+
+/**
+ * Which area a memory belongs to, by rule: the agent's choice, else the area of the memory it replaces, else the
+ * repo in its source, else the one area its content names. Anything else stays general (area null); `hint` is a
+ * name that isn't an area yet, counted toward creating one. Preferences are only labeled by an agent or by
+ * inheritance: a general preference pinned to one project would rank lower everywhere else.
+ */
+export function pickArea(
+  m: { content: string; type: string; source?: string | null },
+  opts: { explicit?: string | null; inherited?: string | null },
+  areas: AreaDef[],
+): { area: string | null; source: AreaSource | null; hint: string | null } {
+  const resolve = (n: string) => resolveArea(n, areas);
+  const explicit = normalizeArea(opts.explicit);
+  if (explicit) return { area: resolve(explicit), source: "agent", hint: resolve(explicit) ? null : explicit };
+  if (opts.inherited) return { area: opts.inherited, source: "inherited", hint: null };
+  const repo = repoFromSource(m.source);
+  const fromRepo = repo ? resolve(repo) : null;
+  // Its repo still counts toward creating that area.
+  if (m.type === "preference") return { area: null, source: null, hint: fromRepo ? null : repo };
+  if (fromRepo) return { area: fromRepo, source: "source", hint: null };
+  const named = areasNamedIn(m.content, areas);
+  if (named.length === 1) return { area: named[0], source: "content", hint: null };
+  return { area: null, source: null, hint: repo };
+}
+
 export interface RecallSignals {
   /** Cosine similarity, when the memory was a semantic hit (>= MIN_SEMANTIC_SIM). */
   similarity?: number;
@@ -128,6 +210,8 @@ export interface RecallSignals {
   keyword?: number;
   status: string;
   updatedAtMs: number;
+  /** The memory is in the area the question is about. */
+  inArea?: boolean;
 }
 
 /**
@@ -141,7 +225,7 @@ export function scoreRecallHit(h: RecallSignals, nowMs = Date.now()): number {
   const kw = Math.min(Math.max(h.keyword ?? 0, 0), 1);
   const ageDays = Math.max(0, (nowMs - h.updatedAtMs) / 86_400_000);
   const status = h.status === "active" ? ACTIVE_BONUS : h.status === "proposed" ? 0 : -OTHER_STATUS_PENALTY;
-  return SEMANTIC_WEIGHT * sem + KEYWORD_WEIGHT * kw + status + RECENCY_BONUS * Math.exp(-ageDays / 180);
+  return SEMANTIC_WEIGHT * sem + KEYWORD_WEIGHT * kw + status + RECENCY_BONUS * Math.exp(-ageDays / 180) + (h.inArea ? AREA_BONUS : 0);
 }
 
 /** bm25 values (lower = better, typically negative) -> strength in (0, 1] relative to the best one. */
@@ -303,10 +387,11 @@ export function fillOwner(text: string, ownerName?: string): string {
 export function slimMemory(m: {
   id: string; content: string; type: string; status: string; source?: string | null; source_date?: string | null;
   confirmed_at?: string | null; updated_at?: string; supersedes?: string | null; similar_to?: string | null; batch_id?: string | null;
-  similar_status?: string | null; score?: number;
+  similar_status?: string | null; score?: number; area?: string | null;
 }): Record<string, unknown> {
   const day = (s?: string | null) => (s ? s.slice(0, 10) : undefined);
   const out: Record<string, unknown> = { id: m.id, type: m.type, status: m.status, content: m.content };
+  if (m.area) out.area = m.area;
   if (m.source) out.source = m.source;
   if (m.source_date) out.source_date = m.source_date;
   if (m.confirmed_at) out.confirmed = day(m.confirmed_at);
@@ -351,6 +436,13 @@ export interface BackupMemory {
   created_at: string; updated_at: string; similar_to: string | null;
   /** content_hash the embedding was made from, and the embedding as base64 Float32 (null when omitted). */
   embedded_hash: string | null; embedding: string | null;
+  /** Area labels; missing in backups made before areas, which are then labeled again on restore. */
+  area?: string | null; area_source?: string | null; area_hint?: string | null;
+}
+export interface BackupArea {
+  name: string; aliases: string[]; description: string; created_by: string; created_at: string;
+  /** Embedding of the description as base64 Float32, or null. */
+  embedding: string | null;
 }
 export interface Backup {
   format: typeof BACKUP_FORMAT; version: number; exported_at: string; embed_model: string;
@@ -361,6 +453,8 @@ export interface Backup {
   exclusions: { id: string; pattern_hash: string; description: string | null; created_at: string }[];
   batches: { id: string; source: string | null; added: number; created_at: string; undone_at: string | null }[];
   audit: { action: string; memory_id: string | null; actor: string | null; details: string | null; timestamp: string }[];
+  /** Missing in backups made before areas. */
+  areas?: BackupArea[];
 }
 
 /** Validate an uploaded backup. Returns the backup, or an error naming the first problem found. */
@@ -378,7 +472,10 @@ export function parseBackup(x: unknown): { backup: Backup } | { error: string } 
   const problem =
     list("memories", (m) => str(m.id) && m.id && str(m.content) && m.content.trim() && STORED_TYPES.includes(m.type) &&
       (MEMORY_STATUSES as readonly string[]).includes(m.status) && str(m.created_at) && str(m.updated_at) &&
-      [m.supersedes, m.source, m.content_hash, m.batch_id, m.source_date, m.confirmed_at, m.similar_to, m.embedded_hash, m.embedding].every(opt)) ??
+      [m.supersedes, m.source, m.content_hash, m.batch_id, m.source_date, m.confirmed_at, m.similar_to, m.embedded_hash, m.embedding,
+        m.area, m.area_source, m.area_hint].every(opt)) ??
+    (o.areas === undefined ? null : list("areas", (a) => str(a.name) && Array.isArray(a.aliases) && a.aliases.every(str) && str(a.description) &&
+      str(a.created_by) && str(a.created_at) && opt(a.embedding))) ??
     list("exclusions", (e) => str(e.id) && str(e.pattern_hash) && str(e.created_at) && opt(e.description)) ??
     list("batches", (b) => str(b.id) && str(b.created_at) && Number.isInteger(b.added) && opt(b.source) && opt(b.undone_at)) ??
     list("guide_history", (g) => Number.isInteger(g.version) && str(g.content) && str(g.updated_at) && opt(g.actor)) ??
@@ -402,4 +499,120 @@ export function base64ToBuffer(s: string): ArrayBuffer {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes.buffer;
+}
+
+// ---------- areas: background labeling ----------
+/** Small Workers AI model that labels memories the rules can't place and describes new areas. */
+export const AREA_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
+/**
+ * The area a question is about, judged by its best search matches: the top match's area, if at least 3 of the top 5
+ * share it. On a real vault (2026-10-20) comparing questions with area descriptions instead scored right and wrong
+ * areas alike (0.63-0.64), while the matches themselves name the area reliably.
+ */
+export function dominantArea(hits: { area?: string | null }[]): string | null {
+  const top = hits.slice(0, 5);
+  const area = top[0]?.area;
+  return area && top.filter((h) => h.area === area).length >= 3 ? area : null;
+}
+/** A new name the model suggests becomes an alias of an area whose description it is this similar to. */
+export const AREA_ALIAS_SIM = 0.85;
+
+/** The area `vec` clearly belongs to: at least `min` similar to its description and `margin` ahead of the next. */
+export function closestArea(vec: ArrayLike<number>, areas: { name: string; vec: ArrayLike<number> }[], min: number, margin: number): string | null {
+  const sims = areas.map((a) => ({ name: a.name, sim: cosine(vec, a.vec) })).sort((a, b) => b.sim - a.sim);
+  if (!sims.length || sims[0].sim < min) return null;
+  return sims.length === 1 || sims[0].sim - sims[1].sim >= margin ? sims[0].name : null;
+}
+
+/** An area whose whole name appears in a suggested name ("lfkai-workshop" -> "lfkai"), so it is an alias, not a new area. */
+export function aliasOf(name: string, areas: AreaDef[]): string | null {
+  return areas.find((a) => `-${name}-`.includes(`-${a.name}-`))?.name ?? null;
+}
+
+export function areaLabelPrompt(m: { content: string; type: string }, areas: { name: string; description: string }[]): string {
+  const known = areas.length ? areas.map((a) => `- ${a.name}${a.description ? `: ${a.description}` : ""}`).join("\n") : "(none yet)";
+  return `You sort the memories in a personal memory vault into areas. An area is one project or product (such as a named app, website or code repo) or one part of the owner's life (such as "career", "running", "family", "health", "home network").
+
+Known areas:
+${known}
+
+Memory (type: ${m.type}):
+"""
+${m.content}
+"""
+
+Which area is this memory about? Answer with only a JSON array:
+- [] if the memory is about the owner in general: who they are, their tools, how they like to work or write, or tastes that apply everywhere; or if you are unsure;
+- ["<known area name>"] if it is about one of the known areas;
+- ["<new area name>"] only if it is clearly about one specific project, product or part of life that is not listed. For a project use its own name; for a part of life use a short common name like "career" (jobs, work history, resumes, job search), "running", "family" or "health". Never use a vague word like "project", "work", "personal" or "technology".
+A memory that only mentions a project or place in passing is not about it: living in a city is not about a website named after it, and building one tool is not about another.`;
+}
+
+/**
+ * Second check before the model's answer puts a memory into an existing area. On a real vault it caught every wrong
+ * placement (a home town into the website named after it, one podcast tool into another), at the cost of leaving a
+ * few right ones general.
+ */
+export function areaConfirmPrompt(content: string, area: { name: string; description: string }): string {
+  return `A personal memory vault sorts memories into areas.
+
+Area "${area.name}": ${area.description || "(no description yet)"}
+
+Memory:
+"""
+${content}
+"""
+
+Is this memory about the area "${area.name}" itself? Answer "yes" or "no" and nothing else. Answer "no" if it only mentions "${area.name}" in passing, or is about the owner, another project, or something with a similar name.`;
+}
+
+/** Second check before a preference is tied to one area: a preference pinned wrongly ranks lower everywhere else. */
+export function areaPreferencePrompt(content: string, area: { name: string; description: string }): string {
+  return `A personal memory vault keeps the owner's preferences. Some apply only to one area of their life; others apply everywhere.
+
+Area "${area.name}": ${area.description || "(no description yet)"}
+
+Preference:
+"""
+${content}
+"""
+
+Does this preference only matter when working on "${area.name}"? Answer "yes" or "no" and nothing else. Answer "no" if it is about the owner in general (their name, taste or way of working) or would also apply elsewhere, even if it mentions "${area.name}".`;
+}
+
+export function areaDescriptionPrompt(name: string, samples: string[]): string {
+  return `These memories from a personal memory vault belong to the area "${name}":
+${samples.map((s) => `- ${s.slice(0, 300)}`).join("\n")}
+
+Write one short line (under 15 words) listing the topics the area "${name}" covers, for example "Garden: vegetable beds, watering schedule, pests". Don't mention the owner or any person by name. Reply with the line only.`;
+}
+
+/**
+ * Area names from a model answer: a JSON array such as `["lfkai"]`, or a bare name (some models drop the brackets);
+ * "none" or "general" mean []. Null for an empty answer or anything else, so the job retries.
+ */
+export function parseAreaNames(text: string): string[] | null {
+  const arrays = text.match(/\[[^\]]*\]/g);
+  if (arrays) {
+    try {
+      const v = JSON.parse(arrays[arrays.length - 1]);
+      return Array.isArray(v) && v.every((x) => typeof x === "string") ? v.slice(0, 3) : null;
+    } catch { return null; }
+  }
+  const bare = text.trim().replace(/["'`.]/g, "");
+  if (!bare) return null;
+  if (/^(none|general)$/i.test(bare)) return [];
+  return bare.length <= 40 && !bare.includes("\n") ? [bare] : null;
+}
+
+/**
+ * The text of a Workers AI chat answer. Some models answer in OpenAI form (`choices`), and Workers AI parses a JSON
+ * answer into `response` (`["lfkai"]` arrives as an array), so this prefers the raw message text.
+ */
+export function chatText(r: unknown): string {
+  const o = r as { response?: unknown; choices?: { message?: { content?: unknown } }[] } | null;
+  const content = o?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (typeof o?.response === "string") return o.response.trim();
+  return o?.response === undefined || o?.response === null ? "" : JSON.stringify(o.response);
 }

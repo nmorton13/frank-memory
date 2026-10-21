@@ -5,7 +5,9 @@ import {
   Backup, BACKUP_FORMAT, BACKUP_VERSION, base64ToBuffer, bufferToBase64, parseBackup,
   AI_TIMEOUT_MS, bestMatch, chunk, classifySimilarity, cosine, coerceItems, contentHash, sha256Hex, ImportItem, isMemoryStatus, isMemoryType,
   keywordStrengths, looksLikeSecret, MAX_GUIDE_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MemoryStatus, metadataProblem, MemoryType, MIN_SEMANTIC_SIM, parseRetentionDays, Retention, RETENTION_DEFAULTS, RETENTION_KEYS,
-  retentionCutoff, sanitizeFtsQuery, scoreRecallHit, splitImportText, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
+  retentionCutoff, sanitizeFtsQuery, scoreRecallHit, slimMemory, splitImportText, TYPE_ORDER,
+  AREA_ALIAS_SIM, AREA_ALL_BUDGET_TOKENS, AREA_MIN_MEMORIES, AREA_MODEL, AreaDef, areaDescriptionPrompt, areaLabelPrompt, areasNamedIn,
+  aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
 } from "./helpers";
 
 export const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -20,11 +22,13 @@ export interface Memory {
   created_at: string; updated_at: string;
   /** Set by bulk import when this item closely resembles an existing memory; the pair is reviewed together. */
   similar_to: string | null; similar_content: string | null; similar_status: string | null;
+  /** The project or area the memory belongs to (null = general); see pickArea. */
+  area: string | null; area_source: string | null; area_hint: string | null;
 }
 export interface RecallHit extends Memory { score: number; matched: ("semantic" | "keyword")[]; similarity?: number }
-export interface ListFilters { type?: string; status?: string; batch_id?: string; q?: string }
+export interface ListFilters { type?: string; status?: string; batch_id?: string; q?: string; area?: string }
 
-const COLS = "id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at, created_at, updated_at, similar_to, " +
+const COLS = "id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at, created_at, updated_at, similar_to, area, area_source, area_hint, " +
   "(SELECT s.content FROM memories s WHERE s.id = memories.similar_to) AS similar_content, " +
   "(SELECT s.status FROM memories s WHERE s.id = memories.similar_to) AS similar_status";
 /** Vectorize ingestion is async (can take minutes); rows written within this window are also scored locally. */
@@ -38,6 +42,8 @@ const CLEANUP_EVERY_MS = 24 * 60 * 60_000;
 const INDEX_BATCH = 100;
 /** Retry backoff for failed index jobs: 1, 2, 4 … minutes, capped at an hour. */
 const indexRetryMs = (attempts: number) => Math.min(60_000 * 2 ** Math.max(attempts - 1, 0), 60 * 60_000);
+/** Background area-labeling jobs per alarm, and attempts before one is given up (the memory stays general). */
+const AREA_JOB_BATCH = 10, AREA_JOB_MAX_ATTEMPTS = 5;
 const now = () => new Date().toISOString();
 const newId = (p = "mem") => `${p}_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
 
@@ -104,6 +110,36 @@ export class MemoryVault extends DurableObject<Env> {
     // v5: revoked OAuth grants. KV (where the OAuth library keeps grants) is eventually consistent, and a refresh
     // racing a revoke can write a grant back; this strongly consistent list is checked on every /mcp request.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS revoked_grants (grant_id TEXT PRIMARY KEY, client_id TEXT, revoked_at TEXT NOT NULL)`);
+    // v6: areas (the project or part of life a memory belongs to), labeled by rule in the background.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS areas (name TEXT PRIMARY KEY, aliases TEXT NOT NULL DEFAULT '[]',
+      description TEXT NOT NULL DEFAULT '', embedding BLOB, created_by TEXT NOT NULL, created_at TEXT NOT NULL)`);
+    // Memories the rules left general, to be labeled in the background (by embedding, then a small model).
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS area_jobs (memory_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL, last_error TEXT)`);
+    const addAreas = !cols.includes("area");
+    if (addAreas) {
+      this.sql.exec(`ALTER TABLE memories ADD COLUMN area TEXT`);
+      this.sql.exec(`ALTER TABLE memories ADD COLUMN area_source TEXT`);
+      this.sql.exec(`ALTER TABLE memories ADD COLUMN area_hint TEXT`);
+    }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_mem_area ON memories(area, status)`);
+    // v7: a memory's area name and aliases are searchable by keyword too, in a second, lower-weighted FTS column.
+    if (!cols.includes("area_terms")) this.sql.exec(`ALTER TABLE memories ADD COLUMN area_terms TEXT`);
+    if (!this.sql.exec(`PRAGMA table_info(memories_fts)`).toArray().some((r) => r.name === "area_terms")) {
+      this.sql.exec(`DROP TRIGGER IF EXISTS memories_ai; DROP TRIGGER IF EXISTS memories_ad; DROP TRIGGER IF EXISTS memories_au; DROP TABLE memories_fts;
+        CREATE VIRTUAL TABLE memories_fts USING fts5(content, area_terms, content='memories', content_rowid='rowid');
+        CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+          INSERT INTO memories_fts(rowid, content, area_terms) VALUES (new.rowid, new.content, new.area_terms);
+        END;
+        CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, content, area_terms) VALUES ('delete', old.rowid, old.content, old.area_terms);
+        END;
+        CREATE TRIGGER memories_au AFTER UPDATE OF content, area_terms ON memories BEGIN
+          INSERT INTO memories_fts(memories_fts, rowid, content, area_terms) VALUES ('delete', old.rowid, old.content, old.area_terms);
+          INSERT INTO memories_fts(rowid, content, area_terms) VALUES (new.rowid, new.content, new.area_terms);
+        END;
+        INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');`);
+    }
     if (!cols.includes("embedded_hash")) {
       this.sql.exec(`ALTER TABLE memories ADD COLUMN embedded_hash TEXT`);
       // Existing embeddings are assumed current; a full re-embed is available from the UI (reindex).
@@ -119,6 +155,339 @@ export class MemoryVault extends DurableObject<Env> {
       this.sql.exec(`INSERT INTO operating_guide(id, content, version, updated_at) VALUES (1, ?, 1, ?)`, guide, t);
       this.sql.exec(`INSERT INTO guide_history(version, content, updated_at, actor) VALUES (1, ?, ?, 'system')`, guide, t);
     }
+    if (addAreas) this.relabelAreas("backfill");
+  }
+
+  // ---------- areas ----------
+  private areaDefs(): AreaDef[] {
+    return this.sql.exec(`SELECT name, aliases FROM areas ORDER BY name`).toArray()
+      .map((r) => ({ name: r.name as string, aliases: JSON.parse(r.aliases as string) as string[] }));
+  }
+
+  /** Set a memory's area and its keyword-search terms (the area's name and aliases). Not an edit: updated_at stays. */
+  private writeArea(id: string, area: string | null, source: string | null, hint: string | null, contentHash?: string) {
+    this.sql.exec(`UPDATE memories SET area = ?, area_source = ?, area_hint = ?, area_terms = ? WHERE id = ?${contentHash ? " AND content_hash = ?" : ""}`,
+      area, source, hint, this.areaTerms(area), id, ...(contentHash ? [contentHash] : []));
+  }
+  private areaTerms(area: string | null): string | null {
+    if (!area) return null;
+    const r = this.sql.exec(`SELECT aliases FROM areas WHERE name = ?`, area).toArray()[0];
+    return [area, ...(r ? (JSON.parse(r.aliases as string) as string[]) : [])].map((t) => t.replace(/-/g, " ")).join(" ");
+  }
+  private refreshAreaTerms(area: string) {
+    this.sql.exec(`UPDATE memories SET area_terms = ? WHERE area = ?`, this.areaTerms(area), area);
+  }
+
+  /** Area names the owner removed: never created again, and treated as "general" when suggested. */
+  private blockedAreas(): string[] {
+    const r = this.sql.exec(`SELECT value FROM settings WHERE key = 'blocked_areas'`).toArray()[0];
+    return r ? (JSON.parse(r.value as string) as string[]) : [];
+  }
+  private setBlockedAreas(names: string[]) {
+    this.sql.exec(`INSERT INTO settings(key, value) VALUES ('blocked_areas', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      JSON.stringify([...new Set(names)].sort()));
+  }
+
+  /**
+   * Label one memory by the area rules (pickArea). An agent's choice sticks until an agent changes it, and the
+   * model's label sticks until the content changes (`reset`). A memory the rules leave
+   * general is queued for background labeling.
+   */
+  private labelArea(id: string, opts: { explicit?: string | null; areas?: AreaDef[]; run?: string; reset?: boolean } = {}) {
+    const m = this.sql.exec(`SELECT content, type, source, status, content_hash, supersedes, area, area_source, area_hint,
+        (SELECT o.area FROM memories o WHERE o.id = memories.supersedes) AS inherited FROM memories WHERE id = ?`, id).toArray()[0];
+    if (!m) return;
+    // The owner's choice (or undo) is never changed automatically.
+    if (m.area_source === "owner") { this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ?`, id); return; }
+    const areas = opts.areas ?? this.areaDefs();
+    const background = !opts.reset && m.area_source === "model";
+    if (background && m.area && !opts.explicit) return;
+    const explicit = opts.explicit ?? (m.area_source === "agent" ? ((m.area ?? m.area_hint) as string | null) : null);
+    let pick: { area: string | null; source: string | null; hint: string | null } = pickArea(
+      m as { content: string; type: string; source: string | null }, { explicit, inherited: m.inherited as string | null }, areas);
+    // The model already looked at this memory: keep its verdict, and use its suggested name once that is an area.
+    if (background && !pick.area && !explicit) {
+      const named = m.area_hint ? resolveArea(m.area_hint as string, areas) : null;
+      pick = named ? { area: named, source: "model", hint: null } : { area: null, source: "model", hint: m.area_hint as string | null };
+    }
+    if (pick.hint && this.blockedAreas().includes(pick.hint)) pick = { ...pick, hint: null };
+    if (pick.area !== m.area || pick.source !== m.area_source || pick.hint !== m.area_hint) {
+      this.writeArea(id, pick.area, pick.source, pick.hint);
+      if (pick.area !== m.area) this.audit("area", id, "system", { from: m.area, to: pick.area, by: pick.source, run: opts.run ?? id });
+    }
+    const live = m.status === "active" || m.status === "proposed";
+    if (!pick.area && live && pick.source !== "agent" && pick.source !== "model")
+      this.sql.exec(`INSERT INTO area_jobs(memory_id, content_hash, next_at) VALUES (?, ?, ?)
+        ON CONFLICT(memory_id) DO UPDATE SET content_hash = excluded.content_hash, attempts = 0, next_at = excluded.next_at, last_error = NULL
+        WHERE area_jobs.content_hash != excluded.content_hash`, id, m.content_hash, now());
+    else this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ?`, id);
+  }
+
+  /** Create an area for each name AREA_MIN_MEMORIES live memories point to, then label general memories again. */
+  private promoteAreas(run = `write-${now()}`, relabel = false) {
+    const ready = this.sql.exec(`SELECT area_hint AS name FROM memories WHERE area IS NULL AND area_hint IS NOT NULL
+        AND status IN ('active','proposed') GROUP BY area_hint HAVING COUNT(*) >= ?`, AREA_MIN_MEMORIES).toArray();
+    if (!ready.length && !relabel) return;
+    const blocked = this.blockedAreas();
+    for (const r of ready) {
+      if (blocked.includes(r.name as string) || this.sql.exec(`SELECT 1 FROM areas WHERE name = ?`, r.name).toArray().length) continue;
+      this.sql.exec(`INSERT INTO areas(name, created_by, created_at) VALUES (?, 'auto', ?)`, r.name, now());
+      this.audit("area_created", null, "system", { name: r.name, run });
+    }
+    const areas = this.areaDefs();
+    // A new area can make a memory name two areas, so labels from content are checked again too.
+    for (const r of this.sql.exec(`SELECT id FROM memories WHERE area IS NULL OR area_source = 'content'`).toArray())
+      this.labelArea(r.id as string, { areas, run });
+  }
+
+  /** Label every memory again, e.g. after the areas migration or a restore. */
+  private relabelAreas(run: string) {
+    const areas = this.areaDefs();
+    // Oldest first, so a replacement inherits its predecessor's area.
+    for (const r of this.sql.exec(`SELECT id FROM memories ORDER BY created_at`).toArray()) this.labelArea(r.id as string, { areas, run });
+    this.promoteAreas(run);
+  }
+
+  /**
+   * Label memories the rules left general, in the background (alarm), by asking AREA_MODEL. Not by embedding: on a
+   * real vault that put memories into the closest existing area before their own area existed (HodlJuice into LFKai).
+   * Failures leave the memory general and retry with backoff.
+   */
+  private async labelAreasInBackground() {
+    await this.describeAreas();
+    const jobs = this.sql.exec(`SELECT memory_id, content_hash, attempts FROM area_jobs WHERE next_at <= ? ORDER BY next_at LIMIT ?`,
+      now(), AREA_JOB_BATCH).toArray();
+    if (!jobs.length) return;
+    const areas = this.areaDefs();
+    const vecs = this.areaVectors();
+    const blocked = this.blockedAreas();
+    const run = `background-${now()}`;
+    let changed = false;
+    for (const j of jobs) {
+      const id = j.memory_id as string, hash = j.content_hash as string;
+      const m = this.sql.exec(`SELECT content, type, status, content_hash, area, area_source FROM memories WHERE id = ?`, id).toArray()[0];
+      if (!m || m.content_hash !== hash || m.area || m.area_source === "agent" || m.area_source === "owner" || (m.status !== "active" && m.status !== "proposed")) {
+        this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ?`, id);
+        continue;
+      }
+      try {
+        const names = await this.askAreaModel(m as { content: string; type: string }, areas);
+        let pick: { area: string | null; hint: string | null; source: string } = { area: null, hint: null, source: "model" };
+        const suggested = names.length === 1 ? normalizeArea(names[0]) : null;
+        const name = suggested && !blocked.includes(suggested) ? suggested : null;
+        if (name) {
+          const known = resolveArea(name, areas) ?? (await this.learnAlias(name, areas, vecs));
+          // An existing area only after a second yes/no check. A new name only counts toward creating that area,
+          // and never for a preference.
+          if (known) {
+            if (await this.confirmArea(m as { content: string; type: string }, known)) pick = { area: known, hint: null, source: "model" };
+          } else if (m.type !== "preference") pick = { area: null, hint: name, source: "model" };
+          if (known) changed = true;
+        }
+        // Only if the memory didn't change while the model was answering.
+        this.writeArea(id, pick.area, pick.source, pick.hint, hash);
+        if (pick.area) this.audit("area", id, "system", { from: null, to: pick.area, by: pick.source, run });
+        this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ? AND content_hash = ?`, id, hash);
+      } catch (e) {
+        const attempts = (j.attempts as number) + 1;
+        if (attempts >= AREA_JOB_MAX_ATTEMPTS) {
+          this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ?`, id);
+          this.audit("area_gave_up", id, "system", { error: (e as Error).message });
+        } else this.sql.exec(`UPDATE area_jobs SET attempts = ?, next_at = ?, last_error = ? WHERE memory_id = ?`,
+          attempts, new Date(Date.now() + indexRetryMs(attempts)).toISOString(), (e as Error).message, id);
+      }
+    }
+    // New aliases can match general memories by name; new hints can reach AREA_MIN_MEMORIES.
+    this.promoteAreas(run, changed);
+  }
+
+  /** Ask AREA_MODEL which area a memory is about. Throws when the model is unavailable or answers nonsense. */
+  private async askAreaModel(m: { content: string; type: string }, areas: AreaDef[]): Promise<string[]> {
+    const described = this.sql.exec(`SELECT name, description FROM areas ORDER BY name`).toArray() as { name: string; description: string }[];
+    const r = await withTimeout(this.env.AI.run(AREA_MODEL as any, {
+      messages: [{ role: "user", content: areaLabelPrompt(m, described.length ? described : areas.map((a) => ({ name: a.name, description: "" }))) }],
+      max_tokens: 40, temperature: 0,
+    }), AI_TIMEOUT_MS, "area model");
+    const names = parseAreaNames(chatText(r));
+    if (!names) throw new Error("area model gave no usable answer");
+    return names;
+  }
+
+  /** Ask AREA_MODEL to confirm a placement: for a preference, that it applies only in that area. */
+  private async confirmArea(m: { content: string; type: string }, area: string): Promise<boolean> {
+    const a = this.sql.exec(`SELECT name, description FROM areas WHERE name = ?`, area).toArray()[0] as { name: string; description: string };
+    const prompt = m.type === "preference" ? areaPreferencePrompt(m.content, a) : areaConfirmPrompt(m.content, a);
+    const r = await withTimeout(this.env.AI.run(AREA_MODEL as any, {
+      messages: [{ role: "user", content: prompt }], max_tokens: 5, temperature: 0,
+    }), AI_TIMEOUT_MS, "area model");
+    const answer = chatText(r).toLowerCase();
+    if (!/^(yes|no)\b/.test(answer)) throw new Error("area model gave no usable answer");
+    return answer.startsWith("yes");
+  }
+
+  /** A name the model suggests that is really an existing area: record it as an alias and return the area. */
+  private async learnAlias(name: string, areas: AreaDef[], vecs: { name: string; vec: Float32Array }[]): Promise<string | null> {
+    let area = aliasOf(name, areas);
+    if (!area && vecs.length) {
+      const v = await this.embed([name.replace(/-/g, " ")]);
+      if (v) area = closestArea(v[0], vecs, AREA_ALIAS_SIM, 0);
+    }
+    if (!area) return null;
+    const def = areas.find((a) => a.name === area)!;
+    if (!def.aliases.includes(name)) {
+      def.aliases.push(name);
+      this.sql.exec(`UPDATE areas SET aliases = ? WHERE name = ?`, JSON.stringify(def.aliases), area);
+      this.refreshAreaTerms(area);
+      this.audit("area_alias", null, "system", { area, alias: name });
+    }
+    return area;
+  }
+
+  /** Write a one-line description for areas that lack one (AREA_MODEL) and embed it, for matching by embedding. */
+  private async describeAreas() {
+    for (const a of this.sql.exec(`SELECT name, description FROM areas WHERE embedding IS NULL ORDER BY created_at LIMIT 3`).toArray()) {
+      const name = a.name as string;
+      let description = a.description as string;
+      if (!description) {
+        const samples = this.sql.exec(`SELECT content FROM memories WHERE area = ? AND status IN ('active','proposed') ORDER BY updated_at DESC LIMIT 8`, name)
+          .toArray().map((r) => r.content as string);
+        try {
+          const r = await withTimeout(this.env.AI.run(AREA_MODEL as any, {
+            messages: [{ role: "user", content: areaDescriptionPrompt(name, samples) }], max_tokens: 60, temperature: 0,
+          }), AI_TIMEOUT_MS, "area model");
+          description = chatText(r).split("\n")[0].replace(/^["']|["']$/g, "").slice(0, 200);
+        } catch (e) { console.warn("area description failed:", (e as Error).message); }
+        if (!description) continue; // retried on the next alarm
+      }
+      const v = await this.embed([`${name.replace(/-/g, " ")}: ${description}`]);
+      this.sql.exec(`UPDATE areas SET description = ?, embedding = ? WHERE name = ?`, description, v ? new Float32Array(v[0]).buffer : null, name);
+    }
+  }
+
+  private areaVectors(): { name: string; vec: Float32Array }[] {
+    return this.sql.exec(`SELECT name, embedding FROM areas WHERE embedding IS NOT NULL`).toArray()
+      .map((r) => ({ name: r.name as string, vec: new Float32Array(r.embedding as ArrayBuffer) }));
+  }
+
+  // ---------- areas: owner actions (dashboard) ----------
+  /** The owner sets a memory's area (null or "general" = no area). A new name creates the area. The choice sticks. */
+  async setMemoryArea(id: string, area: string | null, actor = "ui") {
+    const m = this.get(id);
+    if (!m) return { ok: false, error: "not found" };
+    const general = area === null || area.trim().toLowerCase() === "general";
+    const name = general ? null : normalizeArea(area);
+    if (!general && !name) return { ok: false, error: "that name is too generic or empty for an area" };
+    const target = name ? resolveArea(name, this.areaDefs()) ?? name : null;
+    if (target && !this.sql.exec(`SELECT 1 FROM areas WHERE name = ?`, target).toArray().length) {
+      this.sql.exec(`INSERT INTO areas(name, created_by, created_at) VALUES (?, 'owner', ?)`, target, now());
+      this.setBlockedAreas(this.blockedAreas().filter((b) => b !== target));
+      this.audit("area_created", null, actor, { name: target });
+    }
+    this.writeArea(id, target, "owner", null);
+    this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ?`, id);
+    this.audit("area", id, actor, { from: m.area, to: target, by: "owner" });
+    await this.scheduleAlarm(); // a new area gets its description
+    return { ok: true, area: target };
+  }
+
+  /**
+   * Move every memory of `from` into `into` and keep `from` (and its aliases) as aliases of `into`, so it is never
+   * created again. Into a new name, this is a rename.
+   */
+  async mergeArea(from: string, into: string, actor = "ui") {
+    const src = normalizeArea(from), dst = normalizeArea(into);
+    const a = src ? this.sql.exec(`SELECT * FROM areas WHERE name = ?`, src).toArray()[0] : undefined;
+    if (!a) return { ok: false, error: `no area named ${from}` };
+    if (!dst) return { ok: false, error: "that name is too generic or empty for an area" };
+    const target = resolveArea(dst, this.areaDefs().filter((d) => d.name !== src)) ?? dst;
+    if (target === src) return { ok: false, error: "that is the same area" };
+    const aliases = [...(JSON.parse(a.aliases as string) as string[]), src!];
+    const existing = this.sql.exec(`SELECT aliases FROM areas WHERE name = ?`, target).toArray()[0];
+    if (existing) {
+      const merged = [...new Set([...(JSON.parse(existing.aliases as string) as string[]), ...aliases])].filter((x) => x !== target);
+      this.sql.exec(`UPDATE areas SET aliases = ? WHERE name = ?`, JSON.stringify(merged), target);
+    } else {
+      // A rename keeps the description and its embedding.
+      this.sql.exec(`INSERT INTO areas(name, aliases, description, embedding, created_by, created_at) VALUES (?, ?, ?, ?, 'owner', ?)`,
+        target, JSON.stringify(aliases.filter((x) => x !== target)), a.description, a.embedding, now());
+    }
+    const moved = this.sql.exec(`SELECT COUNT(*) AS n FROM memories WHERE area = ?`, src).one().n as number;
+    this.sql.exec(`UPDATE memories SET area = ? WHERE area = ?`, target, src);
+    this.sql.exec(`DELETE FROM areas WHERE name = ?`, src);
+    this.setBlockedAreas(this.blockedAreas().filter((b) => b !== target));
+    this.refreshAreaTerms(target);
+    this.audit(existing ? "area_merge" : "area_rename", null, actor, { from: src, into: target, memories: moved });
+    return { ok: true, into: target, memories: moved, renamed: !existing };
+  }
+
+  /** Remove an area: its memories become general (and are labeled again), and the name is never created again. */
+  async removeArea(name: string, actor = "ui") {
+    const n = normalizeArea(name);
+    if (!n || !this.sql.exec(`SELECT 1 FROM areas WHERE name = ?`, n).toArray().length) return { ok: false, error: `no area named ${name}` };
+    const ids = this.sql.exec(`SELECT id FROM memories WHERE area = ?`, n).toArray().map((r) => r.id as string);
+    this.sql.exec(`DELETE FROM areas WHERE name = ?`, n);
+    this.setBlockedAreas([...this.blockedAreas(), n]);
+    for (const id of ids) this.writeArea(id, null, null, null);
+    const areas = this.areaDefs();
+    for (const id of ids) this.labelArea(id, { areas, run: `remove-${n}` });
+    this.audit("area_removed", null, actor, { name: n, memories: ids.length });
+    await this.scheduleAlarm();
+    return { ok: true, memories: ids.length };
+  }
+
+  async removedAreas() { return this.blockedAreas(); }
+
+  /** Allow a removed area name to be created again: general memories are labeled afresh, so it can come back. */
+  async unblockArea(name: string, actor = "ui") {
+    const n = normalizeArea(name);
+    this.setBlockedAreas(this.blockedAreas().filter((b) => b !== n));
+    for (const r of this.sql.exec(`SELECT id FROM memories WHERE area IS NULL AND (area_source IS NULL OR area_source = 'model')`).toArray())
+      this.writeArea(r.id as string, null, null, null);
+    this.relabelAreas(`unblock-${n}`);
+    this.audit("area_unblocked", null, actor, { name: n });
+    await this.scheduleAlarm();
+    return { ok: true };
+  }
+
+  /** Recent automatic labeling runs (from the audit log), newest first. */
+  async areaRuns(limit = 20) {
+    return this.sql.exec(`SELECT json_extract(details, '$.run') AS run, COUNT(*) AS changes, MIN(timestamp) AS started, MAX(timestamp) AS finished,
+        SUM(json_extract(details, '$.undone') IS NOT NULL) AS undone
+      FROM audit WHERE action = 'area' AND actor = 'system' AND json_extract(details, '$.run') IS NOT NULL
+      GROUP BY run ORDER BY finished DESC LIMIT ?`, limit).toArray();
+  }
+
+  /**
+   * Undo an automatic labeling run: each memory it changed goes back to its earlier area, unless it changed again
+   * since. The restored labels count as the owner's, so they stick.
+   */
+  async undoAreaRun(run: string, actor = "ui") {
+    const rows = this.sql.exec(`SELECT id, memory_id, details FROM audit WHERE action = 'area' AND actor = 'system'
+        AND json_extract(details, '$.run') = ? AND json_extract(details, '$.undone') IS NULL ORDER BY id DESC`, run).toArray();
+    let restored = 0;
+    for (const r of rows) {
+      const d = JSON.parse(r.details as string) as { from: string | null; to: string | null };
+      const m = this.get(r.memory_id as string);
+      if (m && m.area === d.to) {
+        const back = d.from && this.sql.exec(`SELECT 1 FROM areas WHERE name = ?`, d.from).toArray().length ? d.from : null;
+        this.writeArea(m.id, back, "owner", null);
+        this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ?`, m.id);
+        restored++;
+      }
+      this.sql.exec(`UPDATE audit SET details = json_set(details, '$.undone', ?) WHERE id = ?`, now(), r.id);
+    }
+    this.audit("area_undo", null, actor, { run, restored });
+    return { ok: true, restored };
+  }
+
+  async listAreas() {
+    return this.sql.exec(`SELECT a.name, a.aliases, a.description, a.created_by, a.created_at,
+        (SELECT COUNT(*) FROM memories m WHERE m.area = a.name AND m.status IN ('active','proposed')) AS memories
+      FROM areas a ORDER BY a.name`).toArray()
+      .map((r) => ({
+        name: r.name as string, aliases: JSON.parse(r.aliases as string) as string[], description: r.description as string,
+        created_by: r.created_by as string, created_at: r.created_at as string, memories: r.memories as number,
+      }));
   }
 
   // ---------- internals ----------
@@ -246,10 +615,12 @@ export class MemoryVault extends DurableObject<Env> {
       : { indexed: r.indexed };
   }
 
-  /** Alarm at the earlier of the next daily cleanup and the next due index retry. */
+  /** Alarm at the earlier of the next daily cleanup and the next due index or area job (or an area to describe). */
   private async scheduleAlarm() {
     const cleanupAt = this.nextCleanupAt();
-    const jobAt = this.sql.exec(`SELECT MIN(next_at) AS t FROM index_jobs`).one().t as string | null;
+    const jobAt = this.sql.exec(`SELECT MIN(t) AS t FROM (SELECT MIN(next_at) AS t FROM index_jobs UNION ALL SELECT MIN(next_at) FROM area_jobs
+        UNION ALL SELECT CASE WHEN EXISTS (SELECT 1 FROM areas WHERE embedding IS NULL) THEN ? END)`,
+      new Date(Date.now() + 60_000).toISOString()).one().t as string | null;
     const at = jobAt ? Math.min(cleanupAt, Math.max(Date.parse(jobAt), Date.now() + 1000)) : cleanupAt;
     const cur = await this.ctx.storage.getAlarm();
     if (cur === null || at < cur) await this.ctx.storage.setAlarm(at);
@@ -270,7 +641,7 @@ export class MemoryVault extends DurableObject<Env> {
   // ---------- writes ----------
   async remember(input: {
     content: string; type?: string; source?: string; status?: string; supersedes?: string;
-    source_date?: string; actor?: string;
+    source_date?: string; area?: string; actor?: string;
   }) {
     const actor = input.actor ?? "agent";
     const content = (input.content ?? "").trim();
@@ -340,8 +711,12 @@ export class MemoryVault extends DurableObject<Env> {
       status === "active" && actor === "ui" ? t : null, t, t);
     if (supersedes && status === "active") this.markSuperseded(supersedes, id, actor);
     this.audit("remember", id, actor, { type, status, supersedes });
+    this.labelArea(id, { explicit: input.area });
+    this.promoteAreas();
+    const area = this.get(id)?.area ?? null;
     const idx = await this.indexNow(supersedes ? [id, supersedes] : [id]);
-    return { ok: true, id, status, type, supersedes, ...(note ? { note } : {}), ...idx };
+    await this.scheduleAlarm();
+    return { ok: true, id, status, type, supersedes, ...(area ? { area } : {}), ...(note ? { note } : {}), ...idx };
   }
 
   /** The active memory that (directly or through a chain of replacements) replaced this one, if any. */
@@ -406,6 +781,7 @@ export class MemoryVault extends DurableObject<Env> {
     }
 
     const nearDuplicates: { content: string; matches_id: string; matches: string; similarity: number }[] = [];
+    const areas = this.areaDefs();
     const inserted: { id: string; type: string; status: string; content: string }[] = [];
     const review: { id: string; similar_to: string; similarity: number }[] = [];
     candidates.forEach((c, i) => {
@@ -437,6 +813,7 @@ export class MemoryVault extends DurableObject<Env> {
         id, c.content, type, status, c.source ?? input.source ?? null, c.hash, batchId, c.source_date ?? null, t, t, similarTo,
         vecs ? new Float32Array(vecs[i]).buffer : null, vecs ? c.hash : null);
       if (similarTo) review.push({ id, similar_to: similarTo, similarity });
+      this.labelArea(id, { areas, run: batchId });
       inserted.push({ id, type, status, content: c.content });
       // Later items in the same batch are compared against this one too.
       if (unit) pool.push({ id, content: c.content, vec: unit });
@@ -444,12 +821,14 @@ export class MemoryVault extends DurableObject<Env> {
 
     if (inserted.length) {
       this.sql.exec(`INSERT INTO batches(id, source, added, created_at) VALUES (?, ?, ?, ?)`, batchId, input.source ?? null, inserted.length, t);
+      this.promoteAreas(batchId);
     }
     this.audit("bulk_remember", null, actor, {
       batch_id: batchId, added: inserted.length, needs_review: auto ? 0 : review.length, possible_conflicts: auto ? review.length : 0, near_duplicates: nearDuplicates.length,
       duplicates, excluded, secrets, invalid,
     });
     const idx = await this.indexNow(inserted.map((m) => m.id));
+    await this.scheduleAlarm();
     return {
       ok: true, batch_id: inserted.length ? batchId : null, total: items.length,
       added: inserted.length, active: auto ? inserted.length : inserted.length - review.length,
@@ -488,7 +867,55 @@ export class MemoryVault extends DurableObject<Env> {
   }
 
   // ---------- reads ----------
-  async recall(input: { query: string; limit?: number; type?: string; status?: string }) {
+  /**
+   * Hybrid search, with hits in the question's area ranked higher. The area is `input.area`, else the one area
+   * the query names. With `complete` (agent recall), the results also hold that whole area (within
+   * AREA_ALL_BUDGET_TOKENS) and all general memories (within GENERAL_ALL_BUDGET_TOKENS, else just the general
+   * preferences); the result's `complete` lists which were included ("general" or "general preferences").
+   */
+  async recall(input: { query: string; limit?: number; type?: string; status?: string; area?: string; complete?: boolean }) {
+    const areas = this.areaDefs();
+    const asked = normalizeArea(input.area);
+    const named = areasNamedIn(input.query ?? "", areas);
+    let area = asked ? resolveArea(asked, areas) : named.length === 1 ? named[0] : null;
+    const found = await this.search({ ...input, area });
+    if (!asked && !named.length) area = dominantArea(found.results);
+    if (!input.complete) return { ...found, ...(area ? { area } : {}) };
+    const results: (Memory | RecallHit)[] = [...found.results];
+    const seen = new Set(results.map((h) => h.id));
+    const complete: string[] = [];
+    const add = (label: string, rows: Memory[] | null) => {
+      if (!rows) return;
+      complete.push(label);
+      for (const m of rows) if (!seen.has(m.id)) { seen.add(m.id); results.push(m); }
+    };
+    if (area) add(area, this.wholeArea(input, area, AREA_ALL_BUDGET_TOKENS));
+    const general = this.wholeArea(input, null, GENERAL_ALL_BUDGET_TOKENS);
+    if (general || input.type) add("general", general);
+    else add("general preferences", this.wholeArea({ ...input, type: "preference" }, null, GENERAL_ALL_BUDGET_TOKENS));
+    return { mode: found.mode, ...(area ? { area } : {}), complete, results };
+  }
+
+  /**
+   * Every memory recall may return from one area (null = general), grouped by type and newest first,
+   * or null if they don't fit in `budgetTokens`.
+   */
+  private wholeArea(input: { type?: string; status?: string }, area: string | null, budgetTokens: number): Memory[] | null {
+    const where = [input.status ? "status = ?" : "status IN ('active','proposed')", area ? "area = ?" : "area IS NULL"];
+    const args: unknown[] = input.status ? [input.status] : [];
+    if (area) args.push(area);
+    if (input.type) { where.push("type = ?"); args.push(input.type); }
+    const w = where.join(" AND ");
+    const budget = budgetTokens * 4;
+    // Content alone is a lower bound on the result size, so a large area never loads every row.
+    if (Number(this.sql.exec(`SELECT COALESCE(SUM(LENGTH(content)), 0) AS n FROM memories WHERE ${w}`, ...args).one().n) > budget) return null;
+    const rows = this.sql.exec(`SELECT ${COLS} FROM memories WHERE ${w} ORDER BY updated_at DESC`, ...args).toArray() as unknown as Memory[];
+    if (rows.reduce((n, m) => n + JSON.stringify(slimMemory(m)).length, 0) > budget) return null;
+    const rank = (t: string) => (TYPE_ORDER.includes(t) ? TYPE_ORDER.indexOf(t) : TYPE_ORDER.length);
+    return rows.sort((a, b) => rank(a.type) - rank(b.type));
+  }
+
+  private async search(input: { query: string; limit?: number; type?: string; status?: string; area?: string | null }) {
     const limit = Math.min(Math.max(input.limit ?? 8, 1), 50);
     const query = (input.query ?? "").trim();
     if (!query) return { mode: "none", results: [] as RecallHit[] };
@@ -537,8 +964,8 @@ export class MemoryVault extends DurableObject<Env> {
       if (input.status) { where.push("m.status = ?"); args.push(input.status); }
       else where.push("m.status IN ('active','proposed')");
       keywordRows = this.sql.exec(
-        `SELECT m.id AS id, bm25(memories_fts) AS bm25 FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid
-         WHERE ${where.join(" AND ")} ORDER BY bm25(memories_fts) LIMIT 20`, ...args).toArray()
+        `SELECT m.id AS id, bm25(memories_fts, 1.0, 0.3) AS bm25 FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid
+         WHERE ${where.join(" AND ")} ORDER BY bm25(memories_fts, 1.0, 0.3) LIMIT 20`, ...args).toArray()
         .map((r) => ({ id: r.id as string, bm25: Number(r.bm25) }));
     }
     const keyword = keywordStrengths(keywordRows);
@@ -553,7 +980,7 @@ export class MemoryVault extends DurableObject<Env> {
       const similarity = sims.has(id) ? Number(sims.get(id)!.toFixed(4)) : undefined;
       const score = scoreRecallHit({
         similarity: semanticSet.has(id) ? sims.get(id) : undefined, keyword: keyword.get(id),
-        status: m.status, updatedAtMs: Date.parse(m.updated_at),
+        status: m.status, updatedAtMs: Date.parse(m.updated_at), inArea: !!input.area && m.area === input.area,
       });
       hits.push({ ...m, matched, similarity, score: Number(score.toFixed(6)) });
     }
@@ -567,6 +994,8 @@ export class MemoryVault extends DurableObject<Env> {
     if (filters.status) { where.push("status = ?"); args.push(filters.status); }
     if (filters.batch_id) { where.push("batch_id = ?"); args.push(filters.batch_id); }
     if (filters.q) { where.push(PHRASE_MATCH); args.push(filters.q); }
+    if (filters.area === "general") where.push("area IS NULL");
+    else if (filters.area) { where.push("area = ?"); args.push(normalizeArea(filters.area)); }
     const w = where.length ? `WHERE ${where.join(" AND ")}` : "";
     const total = this.sql.exec(`SELECT COUNT(*) AS n FROM memories ${w}`, ...args).one().n as number;
     const rows = this.sql.exec(`SELECT ${COLS} FROM memories ${w} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
@@ -633,6 +1062,9 @@ export class MemoryVault extends DurableObject<Env> {
     this.sql.exec(`UPDATE memories SET content = ?, type = ?, content_hash = ?, updated_at = ? WHERE id = ?`,
       content, type, hash, now(), id);
     this.audit("update", id, actor, { type });
+    this.labelArea(id, { reset: true });
+    this.promoteAreas();
+    await this.scheduleAlarm();
     // The stored embedding no longer matches content_hash, so it is treated as stale until re-embedded.
     return { ok: true, ...(await this.indexNow([id])) };
   }
@@ -799,13 +1231,12 @@ export class MemoryVault extends DurableObject<Env> {
     if (format === "json") return JSON.stringify({ exported_at: now(), guide, settings: await this.getSettings(), memories }, null, 2);
     let md = `# frank-memory export (${now()})\n\n## Operating Guide (v${guide.version}, ${guide.updated_at})\n\n${guide.content}\n\n# Memories\n`;
     // Known types first, then any legacy ones still stored (e.g. "task" rows from before it was removed).
-    const order = ["fact", "preference", "decision", "project", "note"];
-    for (const t of [...order, ...new Set(memories.map((m) => m.type).filter((x) => !order.includes(x)))]) {
+    for (const t of [...TYPE_ORDER, ...new Set(memories.map((m) => m.type).filter((x) => !TYPE_ORDER.includes(x)))]) {
       const group = memories.filter((m) => m.type === t);
       if (!group.length) continue;
       md += `\n## ${t}\n\n`;
       for (const m of group) {
-        const meta = [m.status, m.source && `source: ${m.source}`, m.source_date && `source date: ${m.source_date}`, `added: ${m.created_at}`, m.confirmed_at && `confirmed: ${m.confirmed_at}`, `id: ${m.id}`].filter(Boolean).join(" · ");
+        const meta = [m.status, m.area && `area: ${m.area}`, m.source && `source: ${m.source}`, m.source_date && `source date: ${m.source_date}`, `added: ${m.created_at}`, m.confirmed_at && `confirmed: ${m.confirmed_at}`, `id: ${m.id}`].filter(Boolean).join(" · ");
         md += `- ${m.content.replace(/\n/g, " ")}\n  <!-- ${meta} -->\n`;
       }
     }
@@ -826,11 +1257,13 @@ export class MemoryVault extends DurableObject<Env> {
       guide_history: all(`SELECT version, content, updated_at, actor FROM guide_history ORDER BY id`),
       settings: Object.fromEntries(all(`SELECT key, value FROM settings`).filter((r) => !LOCAL_SETTINGS.includes(r.key)).map((r) => [r.key, r.value])),
       memories: all(`SELECT id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at, created_at, updated_at,
-          similar_to, embedded_hash, embedding FROM memories ORDER BY created_at, id`)
+          similar_to, embedded_hash, embedding, area, area_source, area_hint FROM memories ORDER BY created_at, id`)
         .map((m) => ({ ...m, embedding: withEmbeddings && m.embedding ? bufferToBase64(m.embedding) : null })),
       exclusions: all(`SELECT id, pattern_hash, description, created_at FROM exclusions ORDER BY created_at, id`),
       batches: all(`SELECT id, source, added, created_at, undone_at FROM batches ORDER BY created_at, id`),
       audit: all(`SELECT action, memory_id, actor, details, timestamp FROM audit ORDER BY id`),
+      areas: all(`SELECT name, aliases, description, embedding, created_by, created_at FROM areas ORDER BY name`)
+        .map((a) => ({ ...a, aliases: JSON.parse(a.aliases), embedding: withEmbeddings && a.embedding ? bufferToBase64(a.embedding) : null })),
     };
   }
 
@@ -857,13 +1290,19 @@ export class MemoryVault extends DurableObject<Env> {
     const previous = this.sql.exec(`SELECT id FROM memories`).toArray().map((r) => r.id as string);
     try {
       this.ctx.storage.transactionSync(() => {
-        for (const table of ["memories", "exclusions", "batches", "guide_history", "audit", "index_jobs"]) this.sql.exec(`DELETE FROM ${table}`);
+        for (const table of ["memories", "exclusions", "batches", "guide_history", "audit", "index_jobs", "area_jobs", "areas"]) this.sql.exec(`DELETE FROM ${table}`);
         this.sql.exec(`DELETE FROM settings WHERE key NOT IN (${LOCAL_SETTINGS.map(() => "?").join(",")})`, ...LOCAL_SETTINGS);
         for (const m of memories)
           this.sql.exec(`INSERT INTO memories(id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at,
-              created_at, updated_at, similar_to, embedding, embedded_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              created_at, updated_at, similar_to, embedding, embedded_hash, area, area_source, area_hint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             m.id, m.content, m.type, m.status, m.supersedes ?? null, m.source ?? null, m.content_hash, m.batch_id ?? null, m.source_date ?? null,
-            m.confirmed_at ?? null, m.created_at, m.updated_at, m.similar_to ?? null, m.embedding, m.embedding ? m.content_hash : null);
+            m.confirmed_at ?? null, m.created_at, m.updated_at, m.similar_to ?? null, m.embedding, m.embedding ? m.content_hash : null,
+            m.area ?? null, m.area_source ?? null, m.area_hint ?? null);
+        for (const a of b.areas ?? []) {
+          const emb = sameModel && a.embedding ? base64ToBuffer(a.embedding) : null;
+          this.sql.exec(`INSERT INTO areas(name, aliases, description, embedding, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+            a.name, JSON.stringify(a.aliases), a.description, emb?.byteLength === EMBED_DIMS * 4 ? emb : null, a.created_by, a.created_at);
+        }
         for (const e of b.exclusions)
           this.sql.exec(`INSERT INTO exclusions(id, pattern_hash, description, created_at) VALUES (?, ?, ?, ?)`, e.id, e.pattern_hash, e.description ?? null, e.created_at);
         for (const x of b.batches)
@@ -886,6 +1325,10 @@ export class MemoryVault extends DurableObject<Env> {
     const reembed = memories.filter((m) => !m.embedding && m.status !== "rejected").length;
     const restored = { memories: memories.length, exclusions: b.exclusions.length, batches: b.batches.length, audit: b.audit.length, guide_version: b.guide.version };
     this.audit("restore", null, actor, { from: b.exported_at, replaced: previous.length, ...restored, reembed });
+    // Restored labels are kept (owner, agent and model choices stick); a backup from before areas is labeled afresh.
+    for (const a of this.areaDefs()) this.refreshAreaTerms(a.name);
+    this.relabelAreas("restore");
+    await this.scheduleAlarm();
     await this.scheduleAlarm();
     return { ok: true, from: b.exported_at, replaced: previous.length, restored, reembed, note: "The search index is rebuilding in the background; keyword search works meanwhile." };
   }
@@ -894,6 +1337,7 @@ export class MemoryVault extends DurableObject<Env> {
   async alarm() {
     try {
       await this.syncIndex();
+      await this.labelAreasInBackground();
       if (Date.now() >= this.nextCleanupAt()) {
         this.sql.exec(`UPDATE settings SET value = ? WHERE key = 'next_cleanup_at'`, String(Date.now() + CLEANUP_EVERY_MS));
         await this.cleanup();

@@ -4,6 +4,7 @@ One long-term memory for all your AI agents. Claude, ChatGPT, Cursor, Codex, and
 
 - **For agents:** seven MCP tools (recall, remember, bulk import, forget, …) and an Operating Guide you control, which tells every agent when to recall, what's worth saving, and what never to save.
 - **For you:** an approval queue (or auto mode), undoable imports, near-duplicate and conflict detection, secret rejection, full backup and restore, and per-app OAuth connections you can revoke.
+- **Areas:** every memory is sorted into an area (a project, or a part of your life like "career" or "home network") automatically, in the background. Agents get the area their question is about, plus everything general about you, instead of the whole vault or a handful of search hits. See [Areas](#areas).
 - **Cost:** personal use should fit within Cloudflare's free tiers (Workers, SQLite Durable Objects, Vectorize, Workers AI, KV, and Access for up to 50 users). Check current limits for your account.
 
 The design follows [Notion's agent memory setup](https://developers.notion.com/prompts/setup), as a self-hosted vault. Quick start: [Setup](#setup), then give each agent `https://<your-host>/connect`.
@@ -17,12 +18,35 @@ It runs on Cloudflare:
 - **Worker** (TypeScript) handles routing; the UI at `/`, JSON at `/api/*`, and MCP at `/mcp`.
 - **Durable Object** `MemoryVault` (SQLite backend) is one vault (`getByName("personal")`). It holds memories, an FTS5 index, the Operating Guide and its history, settings, exclusions, import batches, and an audit log.
 - **Vectorize** `frank-memory-index` (768 dims, cosine) plus **Workers AI** `@cf/baai/bge-base-en-v1.5` provide embeddings.
+- **Workers AI** `@cf/mistralai/mistral-small-3.1-24b-instruct` sorts memories into areas in the background (see [Areas](#areas)).
 - **MCP**: a stateless Streamable HTTP server via the Agents SDK `createMcpHandler` (`agents/mcp/server`, MCP SDK v2 `@modelcontextprotocol/server`).
 
 Recall is hybrid. Vectorize returns the 20 best eligible semantic matches (from 100 candidates), and FTS5 bm25 returns the 20 best eligible keyword matches (stopwords like "what" and "at" are ignored). Each hit is scored by its actual cosine similarity (75%) and its keyword strength relative to the best keyword hit (25%). Active status and recency only nudge near-ties, so a strongly matching *proposed* memory still outranks a weak *active* one. Superseded and rejected items are excluded unless you ask for them. **If Workers AI or Vectorize is unavailable (for example in local dev), writes still succeed and recall falls back to keyword-only** (`mode: "keyword-only"`).
 
+Agent recall (the MCP `recall` tool) adds whole areas to the search hits: matches in the question's area rank higher, and the results also include that area's memories and all general memories in full while they fit a budget. See [Areas](#areas). The dashboard search box only searches.
+
 ## MCP tools
 `get_operating_guide`, `recall`, `remember`, `propose_memory`, `bulk_remember`, `list_memories`, `forget`.
+
+`recall`, `remember`, `propose_memory` and `list_memories` take an optional `area`. Agents don't need it: the vault labels memories itself and works out a question's area. `get_operating_guide` ends with the vault's list of areas.
+
+## Areas
+Each memory can belong to one **area**: a project or product (a repo, an app, a website) or a part of your life ("career", "running", "home network"). A memory with no area is **general**: who you are, your tools, how you like to work. Nobody has to maintain areas; it all happens in the background.
+
+**How a memory gets its area**, in order:
+1. The agent passed `area` (optional; it sticks).
+2. It replaces a memory that had an area (it inherits it).
+3. Its `source` names a repo (`cursor: repo my-app`) that is an area.
+4. Its text names exactly one area or alias.
+5. Otherwise a background job (on the Durable Object alarm) asks Workers AI (`AREA_MODEL`, Mistral Small 3.1) which area it is about. An answer naming an existing area is checked with a second yes/no question before it is used. A new name counts toward creating that area.
+
+**New areas** are created once 3 memories point to the same name (a repo name or the model's suggestion), and the model writes a one-line description. Generic names ("project", "work", "personal") are refused, and suggestions that contain an area's name (`my-app-blog`) become aliases. **Preferences** only join an existing area, after a check that they apply only there, because a general preference filed under one project would stop loading elsewhere. When unsure, a memory stays general.
+
+**Recall:** a question's area is the area it names, or else the area of most of its top matches (3 of the top 5). Matches in that area get a small ranking bonus, but nothing is hidden. Agent recall returns the search hits, then the question's whole area while it fits 4,000 tokens, then all general memories while they fit 6,000 (otherwise all general preferences, and the rest by search). The result's `complete` lists what was included in full. Area names and aliases are also searchable by keyword.
+
+**In the dashboard:** every memory shows its area as a chip; click it to choose an area, "general", or a new name, and your choice is never changed automatically. The **Areas** section lists each area with its description, aliases and memory count, and lets you rename it, merge it into another (the old name becomes an alias), or remove it (its memories are relabeled, and the name won't be created again). **Recent automatic labeling** lists each labeling run with an Undo button.
+
+**Cost and tuning:** one model call per memory the rules can't place, plus one for the check when it lands in an existing area, so a few thousand Workers AI neurons for an initial run over about 100 memories, then a call or two per new memory. The model, prompts and thresholds are in `src/helpers.ts`. They were chosen by testing on a real vault, where a smaller model (`llama-3.1-8b-instruct`) invented generic areas and embedding similarity to area descriptions put memories into the wrong area too often to use.
 
 ## Approval mode
 - `review` (default): agent writes are stored as `proposed` and wait in the UI queue.
@@ -38,7 +62,7 @@ A daily Durable Object alarm removes history past its retention period, set in t
 Active and proposed memories are never removed. **Clean up now** runs it immediately.
 
 ## Backup and restore
-**Download backup** (dashboard, or `GET /api/backup`) saves the whole vault as one JSON file: every memory, including rejected and superseded ones, with its id, timestamps, replacement links, import batch and embedding; forget exclusions; import batches; the guide and its version history; settings; and the audit log. `?embeddings=0` leaves embeddings out (smaller file; they are recomputed on restore). **Export MD/JSON** is a readable copy, not a backup.
+**Download backup** (dashboard, or `GET /api/backup`) saves the whole vault as one JSON file: every memory, including rejected and superseded ones, with its id, timestamps, replacement links, import batch, area and embedding; the areas with their descriptions and aliases; forget exclusions; import batches; the guide and its version history; settings; and the audit log. `?embeddings=0` leaves embeddings out (smaller file; they are recomputed on restore). **Export MD/JSON** is a readable copy, not a backup.
 
 **Restore from file** (`POST /api/restore`) fills an empty vault in one transaction: either all of it is restored or nothing changes. A vault that already has memories is only replaced with `?replace=1` (the dashboard asks first). Content hashes are recomputed; an embedding is kept only if it matches the content and the current embedding model, otherwise that memory is re-embedded. Vectorize is rebuilt in the background through the index queue. OAuth grants live in KV and are not in the backup, so reconnect apps after restoring to a new deployment.
 
@@ -146,13 +170,13 @@ Any client that implements the MCP authorization spec should work with just the 
 Connect an app (for example `claude mcp add …` then `/mcp` → Authenticate), check its tools work, then revoke it under **Connected apps** and confirm it's asked to sign in again.
 
 ## HTTP API (Access identity: you, or an allowed service token)
-`GET/PUT /api/guide` · `GET/PUT /api/settings` · `GET/POST /api/memories` · `PATCH/DELETE /api/memories/:id` · `POST /api/memories/:id/{approve,reject,forget}` (`approve?supersede_similar=1` replaces the similar memory) · `GET /api/recall?q=` · `POST /api/bulk` · `GET /api/batches` · `POST /api/batches/:id/undo` · `GET /api/exclusions` · `GET /api/audit` · `GET /api/export?format=md|json` · `GET /api/backup` · `POST /api/restore?replace=1` · `POST /api/reindex?reembed=1` · `GET /api/oauth/grants` · `DELETE /api/oauth/grants/:id` · `GET /api/oauth/clients` · `DELETE /api/oauth/clients/:id` · `GET /health` and `GET /connect` (public).
+`GET/PUT /api/guide` · `GET/PUT /api/settings` · `GET/POST /api/memories` (`?area=`, `general` for no area) · `PATCH/DELETE /api/memories/:id` · `POST /api/memories/:id/{approve,reject,forget}` (`approve?supersede_similar=1` replaces the similar memory) · `POST /api/memories/:id/area` · `GET /api/recall?q=` (`&area=`, `&complete=1` for agent-style results) · `GET /api/areas` · `POST /api/areas/:name/merge` · `DELETE /api/areas/:name` · `POST /api/areas/:name/unblock` · `POST /api/areas/undo-run` · `POST /api/bulk` · `GET /api/batches` · `POST /api/batches/:id/undo` · `GET /api/exclusions` · `GET /api/audit` · `GET /api/export?format=md|json` · `GET /api/backup` · `POST /api/restore?replace=1` · `POST /api/reindex?reembed=1` · `GET /api/oauth/grants` · `DELETE /api/oauth/grants/:id` · `GET /api/oauth/clients` · `DELETE /api/oauth/clients/:id` · `GET /health` and `GET /connect` (public).
 
 ## Scripts
 `npm run dev` · `npm run deploy` · `npm run deploy:dry` · `npm run typecheck` · `npm test` · `scripts/backup.sh` (download a backup with an Access service token)
 
 ## Notes / future
-- `MemoryVault.alarm()` retries queued index jobs and runs the daily history cleanup.
+- `MemoryVault.alarm()` retries queued index jobs, works through background area labeling (`area_jobs`, 10 per run, retried with backoff, at most 5 attempts), and runs the daily history cleanup.
 - Search indexing is durable. Every change to a memory queues it in `index_jobs` in the same step; the write then tries to index it right away, and the alarm retries failures with backoff (1 min doubling to 1 h). Each memory keeps its embedding in SQLite with `embedded_hash`, the content hash it was made from, so a stale or out-of-order embedding is never used as current. Status changes reuse the stored embedding. "Rebuild search index" in the dashboard (`POST /api/reindex`, `?reembed=1` to recompute embeddings) re-sends every memory from SQLite.
 - Vectorize ingests asynchronously (observed 1–3+ min before `vectorCount` moves). Rows updated in the last 30 min, or still queued for indexing, are scored from their stored embedding instead of Vectorize, so new writes are semantically recallable immediately and stale vectors are ignored. Semantic hits below cosine 0.6 (`MIN_SEMANTIC_SIM`) are dropped.
 - type/status filtering is done in SQL, not by a Vectorize filter. Metadata indexes for `type` and `status` were created anyway for future use: `npx wrangler vectorize create-metadata-index frank-memory-index --propertyName=type --type=string` (and the same for `status`).

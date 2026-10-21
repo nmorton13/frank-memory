@@ -60,11 +60,12 @@ async function api(req: Request, url: URL, vault: DurableObjectStub<MemoryVault>
   if (p === "/reindex" && m === "POST") return json(await vault.rebuildIndex({ reembed: qp.get("reembed") === "1" }, "ui"));
   if (p === "/memories" && m === "GET")
     return json(await vault.listMemories(
-      { type: qp.get("type") || undefined, status: qp.get("status") || undefined, batch_id: qp.get("batch_id") || undefined, q: qp.get("q") || undefined },
+      { type: qp.get("type") || undefined, status: qp.get("status") || undefined, batch_id: qp.get("batch_id") || undefined, q: qp.get("q") || undefined, area: qp.get("area") || undefined },
       intParam(qp.get("limit"), 100, 1, 500), intParam(qp.get("offset"), 0, 0, 1_000_000)));
   if (p === "/memories" && m === "POST") return json(await vault.remember({ ...(await body()), actor: "ui" }));
   if (p === "/recall" && m === "GET")
-    return json(await vault.recall({ query: qp.get("q") ?? "", limit: intParam(qp.get("limit"), 20, 1, 50), type: qp.get("type") || undefined, status: qp.get("status") || undefined }));
+    return json(await vault.recall({ query: qp.get("q") ?? "", limit: intParam(qp.get("limit"), 20, 1, 50), type: qp.get("type") || undefined,
+      status: qp.get("status") || undefined, area: qp.get("area") || undefined, complete: qp.get("complete") === "1" }));
   if ((r = p.match(/^\/memories\/([\w-]+)$/))) {
     if (m === "PATCH") return json(await vault.updateMemory(r[1], await body(), "ui"));
     if (m === "DELETE") return json(await vault.deleteMemory(r[1], "ui"));
@@ -74,6 +75,16 @@ async function api(req: Request, url: URL, vault: DurableObjectStub<MemoryVault>
     if (r[2] === "reject") return json(await vault.reject(r[1], "ui"));
     return json(await vault.forget({ id: r[1], actor: "ui" }));
   }
+  if ((r = p.match(/^\/memories\/([\w-]+)\/area$/)) && m === "POST") {
+    const area = (await body()).area;
+    return json(await vault.setMemoryArea(r[1], typeof area === "string" ? area : null, "ui"));
+  }
+  if (p === "/areas" && m === "GET")
+    return json({ areas: await vault.listAreas(), removed: await vault.removedAreas(), runs: await vault.areaRuns() });
+  if ((r = p.match(/^\/areas\/([\w-]+)\/merge$/)) && m === "POST") return json(await vault.mergeArea(r[1], String((await body()).into ?? ""), "ui"));
+  if ((r = p.match(/^\/areas\/([\w-]+)\/unblock$/)) && m === "POST") return json(await vault.unblockArea(r[1], "ui"));
+  if ((r = p.match(/^\/areas\/([\w-]+)$/)) && m === "DELETE") return json(await vault.removeArea(r[1], "ui"));
+  if (p === "/areas/undo-run" && m === "POST") return json(await vault.undoAreaRun(String((await body()).run ?? ""), "ui"));
   if (p === "/bulk" && m === "POST") {
     const b = await body();
     return json(await vault.bulkRemember({ items: Array.isArray(b.items) ? b.items : undefined, text: b.text, source: b.source ?? "ui paste", actor: "ui" }));

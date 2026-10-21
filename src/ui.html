@@ -22,6 +22,7 @@
   .st-proposed { background:#fef3c7; color:#92400e } .st-superseded,.st-rejected { background:#f3f4f6; color:#6b7280 }
   .muted { color:var(--m) } details summary { cursor:pointer }
   .sim { margin:.35rem 0 0 .2rem; padding:.35rem .6rem; border-left:3px solid #f59e0b; background:#fffbeb; font-size:13px }
+  .area { background:#ecfdf5; color:#065f46; cursor:pointer } .area.general { background:#f3f4f6; color:#6b7280 }
   .toast { position:fixed; bottom:1rem; right:1rem; background:#111827; color:#fff; padding:.5rem .8rem; border-radius:6px; display:none }
 </style>
 </head>
@@ -46,12 +47,21 @@
       <input id="q" placeholder="Search (hybrid recall)…" style="flex:1;min-width:220px">
       <select id="ftype"><option value="">all types</option></select>
       <select id="fstatus"><option value="">active+proposed</option><option>active</option><option>proposed</option><option>superseded</option><option>rejected</option></select>
+      <select id="farea" title="With a search, matches in this area rank first; without one, only this area is listed"><option value="">all areas</option><option value="general">general</option></select>
       <button onclick="loadList()">Search</button>
     </div>
     <details style="margin:.6rem 0"><summary>Add a memory</summary>
       <div class="row" style="margin-top:.4rem"><textarea id="newc" rows="2" placeholder="One standalone fact…"></textarea>
       <select id="newt"></select><button class="p" onclick="addOne()">Add (active)</button></div></details>
     <div id="list"></div>
+  </section>
+
+  <section>
+    <h2>Areas</h2>
+    <p class="meta" style="margin-top:0">Each memory can belong to an area: a project or part of your life. Areas are created and filled automatically; agents get the area a question is about first. Click a memory's area to change it; your choice is never changed automatically.</p>
+    <div id="areas" class="muted">Loading…</div>
+    <div id="removed" class="meta" style="margin-top:.4rem"></div>
+    <h2 style="margin-top:1rem">Recent automatic labeling</h2><div id="runs" class="muted"></div>
   </section>
 
   <section>
@@ -116,8 +126,10 @@ function memHtml(m, pending) {
     "added " + fmt(m.created_at), m.updated_at !== m.created_at && ("updated " + fmt(m.updated_at)),
     m.confirmed_at && ("confirmed " + fmt(m.confirmed_at)), m.batch_id && ("batch " + esc(m.batch_id)),
     m.supersedes && ("supersedes " + esc(m.supersedes)), m.score != null && ("score " + m.score + " [" + m.matched.join("+") + "]")].filter(Boolean).join(" · ");
+  const by = { owner: "set by you", agent: "chosen by an agent", inherited: "from the memory it replaced", source: "from its source repo", content: "named in its text", model: "labeled in the background" }[m.area_source] || "not labeled yet";
   return '<div class="mem" data-id="' + esc(m.id) + '">' +
     '<div class="row"><span class="pill">' + esc(m.type) + '</span><span class="pill st-' + esc(m.status) + '">' + esc(m.status) + '</span>' +
+    '<span class="pill area' + (m.area ? '' : ' general') + '" title="Area: ' + esc(m.area || "general") + ' (' + by + '). Click to change." onclick="pickArea(\'' + m.id + '\')">' + esc(m.area || "general") + '</span>' +
     '<span class="c" style="flex:1">' + esc(m.content) + '</span></div>' +
     (m.similar_to && m.status === "proposed" ? '<div class="sim">Similar to an existing memory' + (m.similar_content == null ? ' (since removed)' : ': ' + esc(m.similar_content)) + '</div>' : '') +
     (m.similar_to && m.status === "active" && m.similar_status === "active" ? '<div class="sim">May conflict with: ' + esc(m.similar_content) + '</div>' : '') +
@@ -143,12 +155,12 @@ async function loadSettings() {
 }
 async function loadPending() { const r = await call("/memories?status=proposed&limit=200"); $("pcount").textContent = r.total; render("pending", r.memories, true); }
 async function loadList() {
-  const q = $("q").value.trim(), t = $("ftype").value, s = $("fstatus").value;
+  const q = $("q").value.trim(), t = $("ftype").value, s = $("fstatus").value, a = $("farea").value;
   if (q) {
-    const r = await call("/recall?q=" + encodeURIComponent(q) + "&type=" + t + "&status=" + s + "&limit=30");
+    const r = await call("/recall?q=" + encodeURIComponent(q) + "&type=" + t + "&status=" + s + "&area=" + encodeURIComponent(a === "general" ? "" : a) + "&limit=30");
     render("list", r.results); if (r.mode !== "hybrid") toast("Search mode: " + r.mode);
   } else {
-    const r = await call("/memories?limit=200&type=" + t + "&status=" + s);
+    const r = await call("/memories?limit=200&type=" + t + "&status=" + s + "&area=" + encodeURIComponent(a));
     render("list", s ? r.memories : r.memories.filter((m) => m.status === "active" || m.status === "proposed"));
   }
 }
@@ -165,7 +177,80 @@ async function loadApps() {
 }
 async function revokeApp(id) { if (confirm("Revoke this app's access? It will need to sign in again.")) { await call("/oauth/grants/" + encodeURIComponent(id) , "DELETE"); toast("Revoked"); loadApps(); } }
 async function loadGuide() { const g = await call("/guide"); $("guide").value = g.content; $("gver").textContent = "v" + g.version; $("gmeta").textContent = "updated " + fmt(g.updated_at) + " · " + g.history.length + " versions" + (g.newer_default ? " · a newer default guide is available: click Load latest default to review it" : ""); }
-async function refresh() { await Promise.all([loadSettings(), loadPending(), loadList(), loadBatches()]); }
+let areaNames = [];
+async function loadAreas() {
+  const r = await call("/areas");
+  areaNames = r.areas.map((a) => a.name);
+  const f = $("farea"), cur = f.value;
+  f.length = 2; areaNames.forEach((n) => f.add(new Option(n, n))); f.value = areaNames.includes(cur) || cur === "general" ? cur : "";
+  $("areas").innerHTML = r.areas.length ? r.areas.map((a) => '<div class="mem" data-area="' + esc(a.name) + '"><div class="row">' +
+    '<b>' + esc(a.name) + '</b><span class="meta">' + a.memories + (a.memories === 1 ? ' memory · ' : ' memories · ') + ({ auto: "created automatically", owner: "created by you" }[a.created_by] || esc(a.created_by)) + '</span><span style="flex:1"></span>' +
+    '<button onclick="renameArea(\'' + a.name + '\')">Rename</button>' +
+    (r.areas.length > 1 ? '<button onclick="mergeArea(\'' + a.name + '\')">Merge into…</button>' : '') +
+    '<button class="d" onclick="removeArea(\'' + a.name + '\')">Remove</button></div>' +
+    '<div class="meta">' + esc(a.description || "Description pending.") + (a.aliases.length ? ' · also called: ' + a.aliases.map(esc).join(", ") : '') + '</div></div>').join("")
+    : "No areas yet. They appear once a few memories share a project.";
+  $("removed").innerHTML = r.removed.length ? "Removed (won't be created again): " + r.removed.map((n) => esc(n) + ' <button onclick="unblockArea(\'' + n + '\')">Allow again</button>').join(" ") : "";
+  $("runs").innerHTML = r.runs.length ? r.runs.map((x) => '<div class="row mem"><span style="flex:1">' + esc(runLabel(x.run)) + ' · ' + x.changes + ' change' + (x.changes === 1 ? '' : 's') + ' · ' + fmt(x.finished) + (x.undone ? ' · undone' : '') + '</span>' +
+    (x.undone < x.changes ? '<button class="d" onclick="undoRun(\'' + encodeURIComponent(x.run) + '\')">Undo</button>' : '') + '</div>').join("") : "Nothing yet.";
+}
+function runLabel(run) {
+  if (run === "backfill") return "First labeling of existing memories";
+  if (run === "restore") return "Labeling after a restore";
+  if (run.startsWith("background-")) return "Background labeling";
+  if (run.startsWith("remove-")) return "Relabeling after removing " + run.slice(7);
+  if (run.startsWith("unblock-")) return "Relabeling after allowing " + run.slice(8) + " again";
+  if (run.startsWith("batch_")) return "Import " + run;
+  return "After a new or edited memory";
+}
+function pickArea(id) {
+  const m = cache[id], chip = document.querySelector('[data-id="' + id + '"] .area');
+  const sel = document.createElement("select");
+  ["general", ...areaNames].forEach((n) => sel.add(new Option(n, n))); sel.add(new Option("new area…", "\u0000new"));
+  sel.value = m.area || "general";
+  chip.replaceWith(sel); sel.focus();
+  sel.onchange = async () => {
+    let area = sel.value;
+    if (area === "\u0000new") {
+      const input = document.createElement("input"); input.placeholder = "area name"; input.style.width = "10em";
+      sel.replaceWith(input); input.focus();
+      input.onkeydown = (e) => { if (e.key === "Enter") save(input.value.trim()); if (e.key === "Escape") refresh(); };
+      return;
+    }
+    save(area);
+  };
+  sel.onblur = () => setTimeout(() => { if (document.body.contains(sel)) refresh(); }, 200);
+  async function save(area) { if (!area) return refresh(); const r = await call("/memories/" + id + "/area", "POST", { area }); if (r.ok) toast("Area: " + (r.area || "general")); refresh(); }
+}
+function renameArea(name) {
+  const row = document.querySelector('[data-area="' + name + '"] b');
+  const input = document.createElement("input"); input.value = name; input.style.width = "12em";
+  row.replaceWith(input); input.focus(); input.select();
+  input.onkeydown = async (e) => {
+    if (e.key === "Escape") return loadAreas();
+    if (e.key !== "Enter" || input.value.trim() === name) return;
+    const r = await call("/areas/" + name + "/merge", "POST", { into: input.value.trim() });
+    if (r.ok) toast(r.renamed ? "Renamed to " + r.into : "Merged into " + r.into); refresh();
+  };
+}
+function mergeArea(name) {
+  const row = document.querySelector('[data-area="' + name + '"] .row');
+  const sel = document.createElement("select"), go = document.createElement("button");
+  areaNames.filter((n) => n !== name).forEach((n) => sel.add(new Option(n, n)));
+  go.textContent = "Merge"; go.className = "p";
+  go.onclick = async () => { if (!confirm("Move all " + name + " memories into " + sel.value + "? " + name + " becomes another name for it.")) return; const r = await call("/areas/" + name + "/merge", "POST", { into: sel.value }); if (r.ok) toast("Merged " + r.memories + " memories into " + r.into); refresh(); };
+  row.append(sel, go);
+}
+async function removeArea(name) {
+  if (!confirm("Remove the area " + name + "? Its memories become general and are labeled again, and " + name + " won't be created again.")) return;
+  const r = await call("/areas/" + name, "DELETE"); if (r.ok) toast("Removed; " + r.memories + " memories relabeled"); refresh();
+}
+async function unblockArea(name) { await call("/areas/" + name + "/unblock", "POST"); loadAreas(); }
+async function undoRun(run) {
+  if (!confirm("Put the memories this run labeled back the way they were? Those labels then count as yours.")) return;
+  const r = await call("/areas/undo-run", "POST", { run: decodeURIComponent(run) }); if (r.ok) toast("Restored " + r.restored + " memories"); refresh();
+}
+async function refresh() { await Promise.all([loadSettings(), loadPending(), loadAreas(), loadList(), loadBatches()]); }
 
 async function act(id, a, replace) { const r = await call("/memories/" + id + "/" + a + (replace ? "?supersede_similar=1" : ""), "POST"); if (r.ok) toast(replace ? "Approved; old memory superseded" : a + "d"); refresh(); }
 async function del(id) { if (confirm("Delete this memory?")) { await call("/memories/" + id, "DELETE"); refresh(); } }
@@ -217,7 +302,7 @@ async function rebuildIndex() {
 function exp(f) { location.href = "/api/export?format=" + f; }
 $("mode").onchange = async (e) => { await call("/settings", "PUT", { approval_mode: e.target.value }); toast("Approval mode: " + e.target.value); };
 $("q").onkeydown = (e) => { if (e.key === "Enter") loadList(); };
-$("ftype").onchange = $("fstatus").onchange = loadList;
+$("ftype").onchange = $("fstatus").onchange = $("farea").onchange = loadList;
 refresh(); loadGuide(); loadApps();
 </script>
 </body>

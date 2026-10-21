@@ -106,6 +106,380 @@ describe("recall eligibility (review #7)", () => {
   });
 });
 
+describe("areas", () => {
+  const ui = { actor: "ui", status: "active" } as const;
+  async function twoAreas() {
+    const h = createVault();
+    const alpha = [], beta = [];
+    for (const c of ["the build uses esbuild", "deploys go out on Fridays", "the logo is teal"])
+      alpha.push((await h.vault.remember({ content: c, source: "cursor: repo alpha-site", ...ui })).id as string);
+    for (const c of ["the router reboots at 3am", "the garage node uses wireless backhaul", "the IoT network is on channel 1"])
+      beta.push((await h.vault.remember({ content: c, source: "claude-code: repo beta (via Claude Code)", ...ui })).id as string);
+    const general = (await h.vault.remember({ content: "Sam lives in Lisbon", type: "fact", ...ui })).id as string;
+    return { h, alpha, beta, general };
+  }
+  const areaOf = (h: ReturnType<typeof createVault>, id: string) => h.rows("id = ?", id)[0].area;
+
+  it("creates an area once three memories come from the same repo, and labels all of them", async () => {
+    const h = createVault();
+    const a = await h.vault.remember({ content: "the build uses esbuild", source: "cursor: repo alpha-site", ...ui });
+    const b = await h.vault.remember({ content: "deploys go out on Fridays", source: "cursor: repo alpha-site", ...ui });
+    expect(areaOf(h, a.id as string)).toBeNull();
+    const c = await h.vault.remember({ content: "the logo is teal", source: "cursor: repo Alpha_Site", ...ui });
+    expect(c).toMatchObject({ area: "alpha-site" });
+    for (const id of [a.id, b.id, c.id]) expect(areaOf(h, id as string)).toBe("alpha-site");
+    expect((await h.vault.listAreas()).map((x) => x.name)).toEqual(["alpha-site"]);
+  });
+
+  it("labels memories that name an area, from any source, and leaves ambiguous ones general", async () => {
+    const { h } = await twoAreas();
+    const named = await h.vault.remember({ content: "Alpha Site launches in May", source: "claude chat", ...ui });
+    const both = await h.vault.remember({ content: "alpha-site and beta share one domain", source: "claude chat", ...ui });
+    expect(named).toMatchObject({ area: "alpha-site" });
+    expect(areaOf(h, both.id as string)).toBeNull();
+  });
+
+  it("never labels a preference by rule, but an agent can, and a replacement inherits its area", async () => {
+    const { h, alpha } = await twoAreas();
+    const pref = await h.vault.remember({ content: "Sam goes by Sam in alpha-site bylines", type: "preference", source: "cursor: repo alpha-site", ...ui });
+    expect(areaOf(h, pref.id as string)).toBeNull();
+    const chosen = await h.vault.remember({ content: "Sam wants teal buttons", type: "preference", area: "Alpha Site", ...ui });
+    expect(areaOf(h, chosen.id as string)).toBe("alpha-site");
+    const next = await h.vault.remember({ content: "deploys now go out on Thursdays", supersedes: alpha[1], ...ui });
+    expect(areaOf(h, next.id as string)).toBe("alpha-site");
+  });
+
+  it("an area an agent names that doesn't exist yet counts toward creating it", async () => {
+    const h = createVault();
+    const ids = [];
+    for (const c of ["tomatoes need staking", "basil goes by the door", "compost turns weekly"])
+      ids.push((await h.vault.remember({ content: c, area: "Garden", ...ui })).id as string);
+    for (const id of ids) expect(areaOf(h, id)).toBe("garden");
+  });
+
+  it("agent recall returns the question's whole area and all general memories, not other areas", async () => {
+    const { h, alpha, beta, general } = await twoAreas();
+    const res = await h.vault.recall({ query: "how does alpha-site build", complete: true });
+    expect(res).toMatchObject({ area: "alpha-site", complete: ["alpha-site", "general"] });
+    const ids = res.results.map((r) => r.id);
+    expect(new Set(ids)).toEqual(new Set([...alpha, general]));
+    expect(ids.some((id) => beta.includes(id))).toBe(false);
+  });
+
+  it("without an area in the question, returns general memories in full and other areas only when they match", async () => {
+    const { h, beta, general } = await twoAreas();
+    const res = await h.vault.recall({ query: "when does the router reboot", complete: true });
+    expect(res).toMatchObject({ complete: ["general"] });
+    expect(res).not.toHaveProperty("area");
+    const ids = res.results.map((r) => r.id);
+    expect(ids[0]).toBe(beta[0]);
+    expect(ids).toContain(general);
+  });
+
+  it("ranks a match in the question's area above an equal match elsewhere", async () => {
+    const { h } = await twoAreas();
+    const inAlpha = await h.vault.remember({ content: "zebra stripes on the alpha-site banner", ...ui });
+    const inBeta = await h.vault.remember({ content: "zebra stripes on the cable labels", source: "repo beta", ...ui });
+    const res = await h.vault.recall({ query: "zebra stripes", area: "beta" });
+    expect(res.results.map((r) => r.id).slice(0, 2)).toEqual([inBeta.id, inAlpha.id]);
+  });
+
+  it("searches instead of returning an area that is over budget", async () => {
+    const h = createVault();
+    for (let i = 0; i < 6; i++)
+      await h.vault.remember({ content: `${"Garden journal entry about tomatoes and weather. ".repeat(65)}${i}`, source: "repo garden", ...ui });
+    const match = await h.vault.remember({ content: "the garden zebra statue is by the shed", source: "repo garden", ...ui });
+    const res = await h.vault.recall({ query: "garden zebra", complete: true });
+    expect(res).toMatchObject({ area: "garden", complete: ["general"] });
+    expect(res.results[0].id).toBe(match.id);
+    expect(res.results.length).toBeLessThanOrEqual(8);
+  });
+
+  it("returns the general preferences in full when all general memories don't fit", async () => {
+    const h = createVault();
+    const prefs = [];
+    for (let i = 0; i < 3; i++) prefs.push((await h.vault.remember({ content: `Sam prefers option ${i}`, type: "preference", ...ui })).id);
+    for (let i = 0; i < 8; i++)
+      await h.vault.remember({ content: `${"Sam's long travel journal about trains and coffee. ".repeat(60)}${i}`, type: "note", ...ui });
+    const res = await h.vault.recall({ query: "what does Sam prefer", complete: true });
+    expect(res).toMatchObject({ complete: ["general preferences"] });
+    expect(res.results.map((r) => r.id)).toEqual(expect.arrayContaining(prefs));
+  });
+
+  it("dashboard search (without complete) only returns matches", async () => {
+    const { h, beta } = await twoAreas();
+    const res = await h.vault.recall({ query: "router reboots" });
+    expect(res).not.toHaveProperty("complete");
+    expect(res.results.map((r) => r.id)).toEqual([beta[0]]);
+  });
+
+  it("filters list_memories by area", async () => {
+    const { h, beta, general } = await twoAreas();
+    expect((await h.vault.listMemories({ area: "beta" })).memories.map((m) => m.id).sort()).toEqual([...beta].sort());
+    expect((await h.vault.listMemories({ area: "general" })).memories.map((m) => m.id)).toEqual([general]);
+  });
+
+  it("labels existing memories when the areas migration first runs", async () => {
+    const { h, alpha, beta, general } = await twoAreas();
+    h.db.exec(`DROP INDEX idx_mem_area; ALTER TABLE memories DROP COLUMN area; ALTER TABLE memories DROP COLUMN area_source;
+      ALTER TABLE memories DROP COLUMN area_hint; DELETE FROM areas`);
+    const again = createVault({ db: h.db });
+    expect((await again.vault.listAreas()).map((x) => x.name)).toEqual(["alpha-site", "beta"]);
+    for (const id of alpha) expect(areaOf(again, id)).toBe("alpha-site");
+    for (const id of beta) expect(areaOf(again, id)).toBe("beta");
+    expect(areaOf(again, general)).toBeNull();
+  });
+});
+
+describe("background area labeling", () => {
+  const ui = { actor: "ui", status: "active" } as const;
+  const areaOf = (h: ReturnType<typeof createVault>, id: string) => (h.db.prepare(`SELECT area FROM memories WHERE id = ?`).get(id) as { area: string | null } | undefined)?.area;
+  async function withAlpha() {
+    const h = createVault();
+    for (const c of ["the build uses esbuild", "deploys go out on Fridays", "the logo is teal"])
+      await h.vault.remember({ content: c, source: "cursor: repo alpha-site", ...ui });
+    await h.vault.alarm(); // writes and embeds the area's description
+    return h;
+  }
+  const alphaVec = (h: ReturnType<typeof createVault>) => h.embeddingOf("alpha site: Work on this area");
+
+  it("asks the model about memories the rules left general, and creates an area from its answers", async () => {
+    const h = createVault();
+    h.state.chat = (p) => (p.startsWith("These memories") ? "Home network gear" : '["Home Network"]');
+    const ids = [];
+    for (const c of ["the router reboots at 3am", "the garage node uses wireless backhaul", "the IoT Wi-Fi is on channel 1"])
+      ids.push((await h.vault.remember({ content: c, ...ui })).id as string);
+    expect(h.areaJobs()).toHaveLength(3);
+    expect(h.state.alarmAt).not.toBeNull();
+    await h.vault.alarm();
+    for (const id of ids) expect(areaOf(h, id)).toBe("home-network");
+    expect(h.areaJobs()).toEqual([]);
+    await h.vault.alarm();
+    expect(await h.vault.listAreas()).toEqual([expect.objectContaining({ name: "home-network", description: "Home network gear", memories: 3 })]);
+  });
+
+  it("keeps a preference the model calls general, without asking again", async () => {
+    const h = await withAlpha();
+    const pref = await h.vault.remember({ content: "Sam goes by Sammy, including in alpha-site bylines", type: "preference", source: "cursor: repo alpha-site", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, pref.id as string)).toBeNull();
+    expect(h.state.prompts.at(-1)).toContain("type: preference");
+    const calls = h.state.chatCalls;
+    for (const c of ["one", "two", "three"]) await h.vault.remember({ content: `gamma note ${c}`, area: "gamma", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, pref.id as string)).toBeNull();
+    expect(h.state.chatCalls).toBe(calls + 1); // only the new gamma area's description
+  });
+
+  it("gives a preference the area the model names only once it confirms the preference applies just there", async () => {
+    const h = await withAlpha();
+    let confirm = "Yes.";
+    h.state.chat = () => '["alpha-site"]';
+    h.state.confirm = () => confirm;
+    const pref = await h.vault.remember({ content: "Sam wants every banner in teal", type: "preference", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, pref.id as string)).toBe("alpha-site");
+    confirm = "No.";
+    const general = await h.vault.remember({ content: "Sam prefers short names", type: "preference", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, general.id as string)).toBeNull();
+  });
+
+  it("asks the model even when a memory is close to an area's description", async () => {
+    const h = await withAlpha();
+    const text = "the staging server needs a bigger disk";
+    h.embedAs(text, vectorNear(alphaVec(h), 0.9, "disk"));
+    h.state.chat = () => '["Beta Lab"]';
+    const m = await h.vault.remember({ content: text, ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, m.id as string)).toBeNull();
+    expect(h.db.prepare(`SELECT area_hint FROM memories WHERE id = ?`).get(m.id as string)).toEqual({ area_hint: "beta-lab" });
+  });
+
+  it("turns a suggested name that contains an area's name into an alias", async () => {
+    const h = await withAlpha();
+    h.state.chat = () => '["Alpha Site blog"]';
+    const m = await h.vault.remember({ content: "the next post covers caching", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, m.id as string)).toBe("alpha-site");
+    expect((await h.vault.listAreas())[0].aliases).toEqual(["alpha-site-blog"]);
+  });
+
+  it("leaves a memory general while the model is down, and labels it on a retry", async () => {
+    const h = await withAlpha();
+    h.state.chat = () => '["alpha-site"]';
+    h.state.chatDown = true;
+    const m = await h.vault.remember({ content: "the next post covers caching", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, m.id as string)).toBeNull();
+    expect(h.areaJobs()).toEqual([expect.objectContaining({ attempts: 1, last_error: "AI unavailable" })]);
+    h.state.chatDown = false;
+    h.makeAreaJobsDue();
+    await h.vault.alarm();
+    expect(areaOf(h, m.id as string)).toBe("alpha-site");
+  });
+
+  it("clears a background label when the memory's text changes", async () => {
+    const h = await withAlpha();
+    h.state.chat = () => '["alpha-site"]';
+    const m = await h.vault.remember({ content: "the next post covers caching", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, m.id as string)).toBe("alpha-site");
+    await h.vault.updateMemory(m.id as string, { content: "Sam's cat is called Miso" });
+    expect(areaOf(h, m.id as string)).toBeNull();
+    expect(h.areaJobs()).toHaveLength(1);
+  });
+
+  it("leaves a memory general when the second check says it isn't about the area", async () => {
+    const h = await withAlpha();
+    h.state.chat = () => '["alpha-site"]';
+    h.state.confirm = (p) => (p.includes("hometown") ? "No." : "Yes.");
+    const town = await h.vault.remember({ content: "Sam's hometown is the alpha valley", ...ui });
+    const site = await h.vault.remember({ content: "the checkout button is green", ...ui });
+    await h.vault.alarm();
+    expect(areaOf(h, town.id as string)).toBeNull();
+    expect(areaOf(h, site.id as string)).toBe("alpha-site");
+    expect(h.state.prompts.some((p) => p.startsWith("A personal memory vault sorts"))).toBe(true);
+  });
+
+  it("never counts a preference toward a new area", async () => {
+    const h = createVault();
+    h.state.chat = () => '["Running"]';
+    for (const c of ["Sam prefers trail shoes", "Sam likes early runs", "Sam wants rest on Mondays"])
+      await h.vault.remember({ content: c, type: "preference", ...ui });
+    await h.vault.alarm();
+    expect(await h.vault.listAreas()).toEqual([]);
+  });
+
+  it("never creates an area from a generic name", async () => {
+    const h = createVault();
+    h.state.chat = () => '["The Project"]';
+    for (const c of ["one thing", "another thing", "a third thing"]) await h.vault.remember({ content: c, ...ui });
+    await h.vault.alarm();
+    expect(await h.vault.listAreas()).toEqual([]);
+  });
+
+  it("checks content labels again when a new area makes a memory name two areas", async () => {
+    const h = await withAlpha();
+    const both = await h.vault.remember({ content: "the beta router hosts the alpha-site preview", ...ui });
+    expect(areaOf(h, both.id as string)).toBe("alpha-site");
+    for (const c of ["one", "two", "three"]) await h.vault.remember({ content: `beta note ${c}`, source: "repo beta", ...ui });
+    expect(areaOf(h, both.id as string)).toBeNull();
+  });
+
+  it("infers the question's area from its best matches", async () => {
+    const h = await withAlpha();
+    for (const c of ["zebra banner", "zebra footer", "zebra favicon"]) await h.vault.remember({ content: `the ${c} is teal`, source: "repo alpha-site", ...ui });
+    await h.vault.remember({ content: "the zebra cable behind the desk is grey and quite long", ...ui });
+    expect(await h.vault.recall({ query: "zebra", complete: true })).toMatchObject({ area: "alpha-site", complete: ["alpha-site", "general"] });
+    expect(await h.vault.recall({ query: "grey cable", complete: true })).toMatchObject({ complete: ["general"] });
+  });
+});
+
+describe("areas in the dashboard", () => {
+  const ui = { actor: "ui", status: "active" } as const;
+  const row = (h: ReturnType<typeof createVault>, id: string) =>
+    h.db.prepare(`SELECT area, area_source, area_hint FROM memories WHERE id = ?`).get(id) as { area: string | null; area_source: string | null; area_hint: string | null };
+  async function withAlpha() {
+    const h = createVault();
+    const ids = [];
+    for (const c of ["the build uses esbuild", "deploys go out on Fridays", "the logo is teal"])
+      ids.push((await h.vault.remember({ content: c, source: "cursor: repo alpha-site", ...ui })).id as string);
+    await h.vault.alarm();
+    return { h, ids };
+  }
+
+  it("the owner's area choice sticks, and a new name creates the area", async () => {
+    const { h, ids } = await withAlpha();
+    expect(await h.vault.setMemoryArea(ids[0], "Garden Plans")).toMatchObject({ ok: true, area: "garden-plans" });
+    expect(row(h, ids[0])).toMatchObject({ area: "garden-plans", area_source: "owner" });
+    for (const c of ["one", "two", "three"]) await h.vault.remember({ content: `beta note ${c}`, source: "repo beta", ...ui });
+    await h.vault.updateMemory(ids[0], { content: "the build uses esbuild 0.25" });
+    expect(row(h, ids[0]).area).toBe("garden-plans");
+    expect(await h.vault.setMemoryArea(ids[1], "general")).toMatchObject({ ok: true, area: null });
+    expect(row(h, ids[1])).toMatchObject({ area: null, area_source: "owner" });
+    expect(h.areaJobs().map((j) => j.memory_id)).not.toContain(ids[1]);
+    expect(await h.vault.setMemoryArea(ids[2], "the project")).toMatchObject({ ok: false });
+  });
+
+  it("merging moves the memories and keeps the old name as an alias", async () => {
+    const { h, ids } = await withAlpha();
+    for (const c of ["one", "two", "three"]) await h.vault.remember({ content: `alpha blog post ${c}`, source: "repo alpha-blog", ...ui });
+    expect(await h.vault.mergeArea("alpha-blog", "alpha-site")).toMatchObject({ ok: true, into: "alpha-site", memories: 3, renamed: false });
+    const areas = await h.vault.listAreas();
+    expect(areas).toEqual([expect.objectContaining({ name: "alpha-site", aliases: ["alpha-blog"], memories: 6 })]);
+    const later = await h.vault.remember({ content: "alpha blog post four", source: "repo alpha-blog", ...ui });
+    expect(row(h, later.id as string).area).toBe("alpha-site");
+    expect(row(h, ids[0]).area).toBe("alpha-site");
+  });
+
+  it("renaming keeps the description and makes both names searchable", async () => {
+    const { h, ids } = await withAlpha();
+    expect(await h.vault.mergeArea("alpha-site", "Marketing Site")).toMatchObject({ ok: true, into: "marketing-site", renamed: true });
+    expect(await h.vault.listAreas()).toEqual([expect.objectContaining({ name: "marketing-site", aliases: ["alpha-site"], description: "Work on this area" })]);
+    expect(row(h, ids[0]).area).toBe("marketing-site");
+    const hits = (await h.vault.recall({ query: "marketing" })).results.map((r) => r.id);
+    expect(new Set(hits)).toEqual(new Set(ids));
+  });
+
+  it("finds a memory by its area's alias even when its text doesn't say it", async () => {
+    const { h, ids } = await withAlpha();
+    h.state.chat = () => '["alpha-site storefront"]';
+    await h.vault.remember({ content: "the checkout button is green", ...ui });
+    await h.vault.alarm();
+    const res = await h.vault.recall({ query: "storefront" });
+    expect(res.results.map((r) => r.id)).toEqual(expect.arrayContaining(ids));
+  });
+
+  it("removing an area makes its memories general and stops it coming back", async () => {
+    const { h, ids } = await withAlpha();
+    h.state.chat = () => '["alpha-site"]';
+    expect(await h.vault.removeArea("alpha-site")).toMatchObject({ ok: true, memories: 3 });
+    expect(await h.vault.listAreas()).toEqual([]);
+    expect(await h.vault.removedAreas()).toEqual(["alpha-site"]);
+    for (const id of ids) expect(row(h, id).area).toBeNull();
+    await h.vault.remember({ content: "the favicon is teal too", source: "repo alpha-site", ...ui });
+    await h.vault.alarm();
+    expect(await h.vault.listAreas()).toEqual([]);
+    for (const id of ids) expect(row(h, id).area).toBeNull();
+    await h.vault.unblockArea("alpha-site");
+    await h.vault.remember({ content: "the footer is teal", source: "repo alpha-site", ...ui });
+    expect((await h.vault.listAreas()).map((a) => a.name)).toEqual(["alpha-site"]);
+  });
+
+  it("undoes a background labeling run, and the restored labels stick", async () => {
+    const { h } = await withAlpha();
+    h.state.chat = () => '["alpha-site"]';
+    const a = await h.vault.remember({ content: "the checkout button is green", ...ui });
+    const b = await h.vault.remember({ content: "the cart icon is a bag", ...ui });
+    await h.vault.alarm();
+    expect(row(h, a.id as string).area).toBe("alpha-site");
+    const run = (await h.vault.areaRuns()).find((r) => String(r.run).startsWith("background-"))!;
+    expect(run).toMatchObject({ changes: 2, undone: 0 });
+    expect(await h.vault.undoAreaRun(run.run as string)).toMatchObject({ ok: true, restored: 2 });
+    for (const id of [a.id, b.id]) expect(row(h, id as string)).toMatchObject({ area: null, area_source: "owner" });
+    expect((await h.vault.areaRuns()).find((r) => r.run === run.run)).toMatchObject({ undone: 2 });
+    await h.vault.alarm();
+    expect(row(h, a.id as string).area).toBeNull();
+  });
+
+  it("backs up and restores areas and labels", async () => {
+    const { h, ids } = await withAlpha();
+    await h.vault.setMemoryArea(ids[0], "general");
+    const file = JSON.parse(JSON.stringify(await h.vault.backup()));
+    const dst = createVault();
+    expect(await dst.vault.restore(file)).toMatchObject({ ok: true });
+    expect(await dst.vault.listAreas()).toEqual([expect.objectContaining({ name: "alpha-site", description: "Work on this area", memories: 2 })]);
+    expect(row(dst, ids[0])).toMatchObject({ area: null, area_source: "owner" });
+    expect((await dst.vault.recall({ query: "alpha" })).results.map((r) => r.id)).toEqual(expect.arrayContaining([ids[1], ids[2]]));
+
+    const old = { ...file, areas: undefined, memories: file.memories.map(({ area, area_source, area_hint, ...m }: any) => m) };
+    const fresh = createVault();
+    expect(await fresh.vault.restore(old)).toMatchObject({ ok: true });
+    expect((await fresh.vault.listAreas()).map((a) => a.name)).toEqual(["alpha-site"]);
+  });
+});
+
 describe("forget by phrase (review #9, #10)", () => {
   it("reports the total and deletes in bounded, previewed steps", async () => {
     const h = createVault();

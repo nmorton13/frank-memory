@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   bestMatch, classifySimilarity, contentHash, fillOwner, listIncludes, intParam, looksLikeSecret, meaningTokens, NEAR_DUP_SIM, parseRetentionDays, retentionCutoff,
   keywordStrengths, sanitizeFtsQuery, scoreRecallHit, SIMILAR_SIM, slimMemory, splitImportText, unitVector, withTimeout,
+  areasNamedIn, chatText, normalizeArea, parseAreaNames, pickArea, repoFromSource,
 } from "../src/helpers";
 
 describe("splitImportText", () => {
@@ -248,5 +249,76 @@ describe("withTimeout", () => {
   it("passes a prompt result through and rejects a slow one", async () => {
     expect(await withTimeout(Promise.resolve(7), 50, "x")).toBe(7);
     await expect(withTimeout(new Promise(() => {}), 20, "embedding")).rejects.toThrow("embedding timed out after 20 ms");
+  });
+});
+
+describe("areas", () => {
+  const areas = [{ name: "frank-memory", aliases: [] }, { name: "lfkai", aliases: [] }, { name: "home-network", aliases: ["aimesh"] }];
+
+  it("normalizes names", () => {
+    expect(normalizeArea("LFKai.town")).toBe("lfkai");
+    expect(normalizeArea(" Frank_Memory ")).toBe("frank-memory");
+    expect(normalizeArea("HodlJuice.app")).toBe("hodljuice");
+    expect(normalizeArea("General")).toBeNull();
+    expect(normalizeArea("")).toBeNull();
+  });
+
+  it("reads the repo from a source", () => {
+    expect(repoFromSource("claude-code: repo frank-memory (via Claude Code)")).toBe("frank-memory");
+    expect(repoFromSource("cursor: repo LFKai")).toBe("lfkai");
+    expect(repoFromSource("claude chat")).toBeNull();
+  });
+
+  it("finds area names as whole words", () => {
+    expect(areasNamedIn("Frank Memory is deployed", areas)).toEqual(["frank-memory"]);
+    expect(areasNamedIn("bought lfkai.town", areas)).toEqual(["lfkai"]);
+    expect(areasNamedIn("the AiMesh node", areas)).toEqual(["home-network"]);
+    expect(areasNamedIn("xlfkai and lfkaix", areas)).toEqual([]);
+  });
+
+  it("picks an area by rule", () => {
+    const note = (content: string, source?: string) => ({ content, type: "note", source });
+    expect(pickArea(note("x", "repo lfkai"), {}, areas)).toEqual({ area: "lfkai", source: "source", hint: null });
+    expect(pickArea(note("x", "repo newthing"), {}, areas)).toEqual({ area: null, source: null, hint: "newthing" });
+    expect(pickArea(note("the LFKai domain"), {}, areas)).toEqual({ area: "lfkai", source: "content", hint: null });
+    expect(pickArea(note("LFKai uses frank-memory"), {}, areas).area).toBeNull();
+    expect(pickArea(note("x", "repo lfkai"), { explicit: "Garden" }, areas)).toEqual({ area: null, source: "agent", hint: "garden" });
+    expect(pickArea(note("x"), { inherited: "lfkai" }, areas)).toEqual({ area: "lfkai", source: "inherited", hint: null });
+    const pref = { content: "Nate is used in the LFKai byline", type: "preference", source: "repo lfkai" };
+    expect(pickArea(pref, {}, areas).area).toBeNull();
+  });
+
+  it("gives hits in the question's area a bonus", () => {
+    const base = { similarity: 0.8, status: "active", updatedAtMs: 0 };
+    expect(scoreRecallHit({ ...base, inArea: true }, 0)).toBeCloseTo(scoreRecallHit(base, 0) + 0.1);
+  });
+});
+
+describe("area model answers", () => {
+  it("parses arrays, bare names and 'none'", () => {
+    expect(parseAreaNames('["lfkai"]')).toEqual(["lfkai"]);
+    expect(parseAreaNames("Sure: []")).toEqual([]);
+    expect(parseAreaNames("home-network")).toEqual(["home-network"]);
+    expect(parseAreaNames('"None."')).toEqual([]);
+    expect(parseAreaNames("I think this memory is mostly about\nthe router")).toBeNull();
+  });
+
+  it("treats generic names as no area", () => {
+    for (const n of ["The Project", "work", "Technology", "home", "general"]) expect(normalizeArea(n)).toBeNull();
+    expect(normalizeArea("Home Network")).toBe("home-network");
+  });
+
+  it("counts a preference's repo toward creating the area without labeling it", () => {
+    expect(pickArea({ content: "x", type: "preference", source: "repo lfkai" }, {}, [])).toEqual({ area: null, source: null, hint: "lfkai" });
+  });
+});
+
+describe("chatText", () => {
+  it("reads the answer in each Workers AI shape", () => {
+    expect(chatText({ response: "lfkai" })).toBe("lfkai");
+    expect(chatText({ response: ["home network"], choices: [{ message: { content: '["home network"]' } }] })).toBe('["home network"]');
+    expect(chatText({ response: ["home network"] })).toBe('["home network"]');
+    expect(chatText({})).toBe("");
+    expect(parseAreaNames("")).toBeNull();
   });
 });

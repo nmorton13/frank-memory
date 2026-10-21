@@ -75,15 +75,29 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
   const overrides = new Map<string, number[]>();
   let pause: { gate: Promise<void>; reached: () => void } | null = null;
   /** Outage switches and call counts, for tests. */
-  const state = { aiDown: false, vectorizeDown: false, aiHang: false, vectorizeHang: false, aiCalls: 0, alarmAt: null as number | null };
+  const state = {
+    aiDown: false, vectorizeDown: false, aiHang: false, vectorizeHang: false, aiCalls: 0, alarmAt: null as number | null,
+    /** Answers of the chat model (area labeling and descriptions), by prompt; counted separately from aiCalls. */
+    chat: (prompt: string): string => (prompt.startsWith("These memories") ? "Work on this area" : "[]"),
+    /** Answers to the yes/no checks before a memory is put into an existing area. */
+    confirm: (_prompt: string): string => "Yes.",
+    chatDown: false, chatCalls: 0, prompts: [] as string[],
+  };
 
   const AI = {
-    async run(_model: string, input: { text: string[] }) {
+    async run(_model: string, input: { text?: string[]; messages?: { content: string }[] }) {
+      if (input.messages) {
+        state.chatCalls++;
+        if (state.chatDown) throw new Error("AI unavailable");
+        const prompt = input.messages[input.messages.length - 1].content;
+        state.prompts.push(prompt);
+        return { response: prompt.startsWith("A personal memory vault") ? state.confirm(prompt) : state.chat(prompt) };
+      }
       state.aiCalls++;
       if (state.aiDown) throw new Error("AI unavailable");
       if (state.aiHang) return new Promise<never>(() => {});
       if (pause) { const p = pause; pause = null; p.reached(); await p.gate; }
-      return { data: input.text.map((t) => overrides.get(t) ?? hashVector(t)) };
+      return { data: input.text!.map((t) => overrides.get(t) ?? hashVector(t)) };
     },
   };
   const VECTORIZE = {
@@ -126,6 +140,9 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
     /** Make every queued index job due now (instead of waiting out its backoff). */
     makeJobsDue() { db.prepare(`UPDATE index_jobs SET next_at = ?`).run(new Date(0).toISOString()); },
     jobs() { return db.prepare(`SELECT memory_id, attempts, last_error FROM index_jobs`).all() as any[]; },
+    areaJobs() { return db.prepare(`SELECT memory_id, attempts, last_error FROM area_jobs`).all() as any[]; },
+    /** Make every queued area job due now. */
+    makeAreaJobsDue() { db.prepare(`UPDATE area_jobs SET next_at = ?`).run(new Date(0).toISOString()); },
     db,
     vectors: vectorsById,
     /** Pin the embedding returned for an exact text. */
@@ -139,7 +156,7 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
       return { reached: reachedP, release: () => release() };
     },
     rows(where = "1=1", ...args: any[]) {
-      return db.prepare(`SELECT id, content, status, supersedes, similar_to, batch_id, updated_at FROM memories WHERE ${where}`).all(...args) as any[];
+      return db.prepare(`SELECT id, content, status, supersedes, similar_to, batch_id, updated_at, area FROM memories WHERE ${where}`).all(...args) as any[];
     },
   };
 }
