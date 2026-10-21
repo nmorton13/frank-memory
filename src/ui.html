@@ -189,12 +189,12 @@ async function loadAreas() {
   f.length = 2; areaNames.forEach((n) => f.add(new Option(n, n))); f.value = areaNames.includes(cur) || cur === "general" ? cur : "";
   $("areas").innerHTML = r.areas.length ? r.areas.map((a) => '<div class="mem" data-area="' + esc(a.name) + '"><div class="row">' +
     '<b>' + esc(a.name) + '</b><span class="meta">' + a.memories + (a.memories === 1 ? ' memory · ' : ' memories · ') + ({ auto: "created automatically", owner: "created by you" }[a.created_by] || esc(a.created_by)) + '</span><span style="flex:1"></span>' +
-    '<button onclick="renameArea(\'' + a.name + '\')">Rename</button>' +
-    (r.areas.length > 1 ? '<button onclick="mergeArea(\'' + a.name + '\')">Merge into…</button>' : '') +
-    '<button class="d" onclick="removeArea(\'' + a.name + '\')">Remove</button></div>' +
+    '<button onclick="renameArea(decodeURIComponent(\'' + escJs(a.name) + '\'))">Rename</button>' +
+    (r.areas.length > 1 ? '<button onclick="mergeArea(decodeURIComponent(\'' + escJs(a.name) + '\'))">Merge into…</button>' : '') +
+    '<button class="d" onclick="removeArea(decodeURIComponent(\'' + escJs(a.name) + '\'))">Remove</button></div>' +
     '<div class="meta">' + esc(a.description || "Description pending.") + (a.aliases.length ? ' · also called: ' + a.aliases.map(esc).join(", ") : '') + '</div></div>').join("")
     : "No areas yet. They appear once a few memories share a project.";
-  $("removed").innerHTML = r.removed.length ? "Removed (won't be created again): " + r.removed.map((n) => esc(n) + ' <button onclick="unblockArea(\'' + n + '\')">Allow again</button>').join(" ") : "";
+  $("removed").innerHTML = r.removed.length ? "Removed (won't be created again): " + r.removed.map((n) => esc(n) + ' <button onclick="unblockArea(decodeURIComponent(\'' + escJs(n) + '\'))">Allow again</button>').join(" ") : "";
   $("runs").innerHTML = r.runs.length ? r.runs.map((x) => '<div class="row mem"><span style="flex:1">' + esc(runLabel(x.run)) + ' · ' + x.changes + ' change' + (x.changes === 1 ? '' : 's') + ' · ' + fmt(x.finished) + (x.undone ? ' · undone' : '') + '</span>' +
     (x.undone < x.changes ? '<button class="d" onclick="undoRun(\'' + escJs(x.run) + '\')">Undo</button>' : '') + '</div>').join("") : "Nothing yet.";
 }

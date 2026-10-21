@@ -317,6 +317,18 @@ describe("background area labeling", () => {
     expect(areaOf(h, general.id as string)).toBeNull();
   });
 
+  it("keeps an area the owner picks while the model is still answering", async () => {
+    const h = await withAlpha();
+    const m = await h.vault.remember({ content: "the staging server needs a bigger disk", ...ui });
+    h.state.chat = () => {
+      h.db.prepare(`UPDATE memories SET area = 'alpha-site', area_source = 'owner' WHERE id = ?`).run(m.id as string);
+      return '["Beta Lab"]';
+    };
+    await h.vault.alarm();
+    expect(h.db.prepare(`SELECT area, area_source, area_hint FROM memories WHERE id = ?`).get(m.id as string))
+      .toEqual({ area: "alpha-site", area_source: "owner", area_hint: null });
+  });
+
   it("asks the model even when a memory is close to an area's description", async () => {
     const h = await withAlpha();
     const text = "the staging server needs a bigger disk";
@@ -897,6 +909,21 @@ describe("merging repeats in the background", () => {
     expect([status(h, a), status(h, b)]).toEqual(["active", "active"]);
   });
 
+  it("undoing an import also removes what merging wrote from it, and brings back what it was merged with", async () => {
+    const h = createVault({ approvalMode: "auto" });
+    const text = "Sam has been at Acme since 2020";
+    h.embedAs(text, vectorNear(h.embeddingOf("Sam works at Acme as a designer"), 0.85));
+    const a = (await h.vault.remember({ content: "Sam works at Acme as a designer", type: "fact" })).id as string;
+    const imp = await h.vault.bulkRemember({ items: [{ content: text, type: "fact" }] }) as { batch_id: string };
+    const b = h.rows("content = ?", text)[0].id as string;
+    h.state.merge = answers({ merged: '"Sam has worked at Acme as a designer since 2020."', check: keepsBoth });
+    await h.vault.alarm();
+    expect([status(h, a), status(h, b)]).toEqual(["superseded", "superseded"]);
+
+    expect(await h.vault.undoBatch(imp.batch_id)).toMatchObject({ removed: 2, restored: 1 });
+    expect(h.rows("1 = 1").map((m) => [m.id, m.status])).toEqual([[a, "active"]]);
+  });
+
   it("keeps both when the model says they are different, or a merge loses a detail or fails the check", async () => {
     const no = await pair("Sam's garage node is at .166", "Sam's basement node is at .165");
     await no.h.vault.alarm(); // default answer: No
@@ -1144,6 +1171,10 @@ describe("full backup and restore (review #5)", () => {
     expect(await dst.vault.restore({ ...good, memories: [{ ...good.memories[0], status: "deleted" }] })).toMatchObject({ ok: false, error: "memories[0] is malformed" });
     expect(await dst.vault.restore({ ...good, memories: [good.memories[0], good.memories[0]] })).toMatchObject({ ok: false, error: expect.stringMatching(/duplicate memory id/) });
     expect(await dst.vault.restore({ ...good, memories: [{ ...good.memories[0], id: "x');alert(1);('" }] })).toMatchObject({ ok: false, error: "memories[0] is malformed" });
+    const area = { name: "x');alert(1);('", aliases: [], description: "", created_by: "owner", created_at: good.exported_at };
+    expect(await dst.vault.restore({ ...good, areas: [area] })).toMatchObject({ ok: false, error: "areas[0] is malformed" });
+    expect(await dst.vault.restore({ ...good, settings: { ...good.settings, blocked_areas: JSON.stringify(["x');alert(1);('"]) } }))
+      .toMatchObject({ ok: false, error: "settings.blocked_areas is malformed" });
 
     const mine = await dst.vault.remember({ content: "kept when a restore fails" });
     const before = dump(dst);

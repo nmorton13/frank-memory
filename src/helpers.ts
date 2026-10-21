@@ -478,6 +478,8 @@ export function parseBackup(x: unknown): { backup: Backup } | { error: string } 
   // Ids end up in dashboard markup, so only the characters newId produces get in.
   const id = (v: unknown) => typeof v === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(v);
   const optId = (v: unknown) => v === null || v === undefined || id(v);
+  // Area names too: only the canonical form normalizeArea produces.
+  const areaName = (v: unknown) => typeof v === "string" && normalizeArea(v) === v;
   const list = (name: string, ok: (r: any) => boolean): string | null => {
     if (!Array.isArray(o[name])) return `${name} must be a list`;
     const i = o[name].findIndex((r: any) => !r || typeof r !== "object" || !ok(r));
@@ -488,7 +490,7 @@ export function parseBackup(x: unknown): { backup: Backup } | { error: string } 
       (MEMORY_STATUSES as readonly string[]).includes(m.status) && str(m.created_at) && str(m.updated_at) &&
       [m.source, m.content_hash, m.source_date, m.confirmed_at, m.embedded_hash, m.embedding,
         m.area, m.area_source, m.area_hint].every(opt) && [m.supersedes, m.batch_id, m.similar_to].every(optId)) ??
-    (o.areas === undefined ? null : list("areas", (a) => str(a.name) && Array.isArray(a.aliases) && a.aliases.every(str) && str(a.description) &&
+    (o.areas === undefined ? null : list("areas", (a) => areaName(a.name) && Array.isArray(a.aliases) && a.aliases.every(str) && str(a.description) &&
       str(a.created_by) && str(a.created_at) && opt(a.embedding))) ??
     list("exclusions", (e) => id(e.id) && str(e.pattern_hash) && str(e.created_at) && opt(e.description)) ??
     list("batches", (b) => id(b.id) && str(b.created_at) && Number.isInteger(b.added) && opt(b.source) && opt(b.undone_at)) ??
@@ -497,6 +499,10 @@ export function parseBackup(x: unknown): { backup: Backup } | { error: string } 
   if (problem) return { error: problem };
   if (!o.guide || !str(o.guide.content) || !o.guide.content.trim() || !Number.isInteger(o.guide.version) || !str(o.guide.updated_at)) return { error: "guide is malformed" };
   if (!o.settings || typeof o.settings !== "object" || !Object.values(o.settings).every(str)) return { error: "settings must map names to strings" };
+  if (o.settings.blocked_areas !== undefined) {
+    let blocked: unknown; try { blocked = JSON.parse(o.settings.blocked_areas); } catch { blocked = null; }
+    if (!Array.isArray(blocked) || !blocked.every(areaName)) return { error: "settings.blocked_areas is malformed" };
+  }
   const ids = new Set<string>();
   for (const m of o.memories) { if (ids.has(m.id)) return { error: `duplicate memory id ${m.id}` }; ids.add(m.id); }
   return { backup: o as Backup };

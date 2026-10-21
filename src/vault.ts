@@ -188,9 +188,9 @@ export class MemoryVault extends DurableObject<Env> {
   }
 
   /** Set a memory's area and its keyword-search terms (the area's name and aliases). Not an edit: updated_at stays. */
-  private writeArea(id: string, area: string | null, source: string | null, hint: string | null, contentHash?: string) {
-    this.sql.exec(`UPDATE memories SET area = ?, area_source = ?, area_hint = ?, area_terms = ? WHERE id = ?${contentHash ? " AND content_hash = ?" : ""}`,
-      area, source, hint, this.areaTerms(area), id, ...(contentHash ? [contentHash] : []));
+  private writeArea(id: string, area: string | null, source: string | null, hint: string | null) {
+    this.sql.exec(`UPDATE memories SET area = ?, area_source = ?, area_hint = ?, area_terms = ? WHERE id = ?`,
+      area, source, hint, this.areaTerms(area), id);
   }
   private areaTerms(area: string | null): string | null {
     if (!area) return null;
@@ -313,9 +313,12 @@ export class MemoryVault extends DurableObject<Env> {
             if (await this.confirmArea(m as { content: string; type: string }, known)) pick = { area: known, hint: null, source: "model" };
           } else if (m.type !== "preference") pick = { area: null, hint: name, source: "model" };
         }
-        // Only if the memory didn't change while the model was answering.
-        this.writeArea(id, pick.area, pick.source, pick.hint, hash);
-        if (pick.area) this.audit("area", id, "system", { from: null, to: pick.area, by: pick.source, run });
+        // Only if the memory didn't change, and nobody gave it an area, while the model was answering.
+        const cur = this.sql.exec(`SELECT content_hash, area, area_source FROM memories WHERE id = ?`, id).toArray()[0];
+        if (cur && cur.content_hash === hash && !cur.area && cur.area_source !== "agent" && cur.area_source !== "owner") {
+          this.writeArea(id, pick.area, pick.source, pick.hint);
+          if (pick.area) this.audit("area", id, "system", { from: null, to: pick.area, by: pick.source, run });
+        }
         this.sql.exec(`DELETE FROM area_jobs WHERE memory_id = ? AND content_hash = ?`, id, hash);
       } catch (e) {
         const attempts = (j.attempts as number) + 1;
@@ -678,6 +681,12 @@ export class MemoryVault extends DurableObject<Env> {
   }
 
   // ---------- internals ----------
+  /** Automatic merges not undone, from the audit log (so ones older than its retention are unknown). */
+  private automaticMerges(): { into: string; from: string[]; kept: boolean }[] {
+    return this.sql.exec(`SELECT details FROM audit WHERE action = 'merge'`).toArray()
+      .map((r) => JSON.parse(r.details as string) as { into: string; from: string[]; kept?: boolean; undone?: string })
+      .filter((d) => !d.undone).map((d) => ({ into: d.into, from: d.from, kept: !!d.kept }));
+  }
   private audit(action: string, memoryId: string | null, actor = "system", details?: unknown) {
     this.sql.exec(`INSERT INTO audit(action, memory_id, actor, details, timestamp) VALUES (?, ?, ?, ?, ?)`,
       action, memoryId, actor, details === undefined ? null : JSON.stringify(details), now());
@@ -1040,18 +1049,29 @@ export class MemoryVault extends DurableObject<Env> {
   }
 
   /**
-   * Remove a batch's memories. Memories that an approved item from the batch replaced become active again,
-   * unless something outside the batch has replaced them since.
+   * Remove a batch's memories, and what automatic merging wrote from them. Memories that an approved item from the
+   * batch replaced, or that were merged with one, become active again, unless something else has replaced them since.
    */
   async undoBatch(batchId: string, actor = "ui") {
     const rows = this.sql.exec(`SELECT id, status, supersedes FROM memories WHERE batch_id = ?`, batchId).toArray();
-    const ids = rows.map((r) => r.id as string);
-    const replaced = [...new Set(rows.filter((r) => r.status === "active" && r.supersedes).map((r) => r.supersedes as string))];
-    this.sql.exec(`DELETE FROM memories WHERE batch_id = ?`, batchId);
+    const removed = new Set(rows.map((r) => r.id as string));
+    const replaced = new Set(rows.filter((r) => r.status === "active" && r.supersedes).map((r) => r.supersedes as string));
+    // A memory written by merging one of them holds its text, so it goes too (and so on). What a removed memory
+    // was merged with comes back.
+    const merges = this.automaticMerges();
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const m of merges)
+        if (!m.kept && !removed.has(m.into) && m.from.some((f) => removed.has(f))) { removed.add(m.into); grew = true; }
+    }
+    for (const m of merges) if (removed.has(m.into)) m.from.forEach((f) => replaced.add(f));
+    const ids = [...removed];
+    for (const id of ids) this.sql.exec(`DELETE FROM memories WHERE id = ?`, id);
     const t = now();
     const restored: string[] = [];
     for (const id of replaced) {
-      const stillReplaced = this.sql.exec(`SELECT 1 FROM memories WHERE supersedes = ? AND status IN ('active','superseded') LIMIT 1`, id).toArray().length > 0;
+      const stillReplaced = this.sql.exec(`SELECT 1 FROM memories WHERE supersedes = ? AND status IN ('active','superseded') LIMIT 1`, id).toArray().length > 0 ||
+        merges.some((m) => !removed.has(m.into) && m.from.includes(id) && this.get(m.into));
       if (stillReplaced || this.get(id)?.status !== "superseded") continue;
       this.sql.exec(`UPDATE memories SET status = 'active', updated_at = ? WHERE id = ?`, t, id);
       restored.push(id);
