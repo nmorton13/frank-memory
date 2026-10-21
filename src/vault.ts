@@ -601,6 +601,12 @@ export class MemoryVault extends DurableObject<Env> {
     const same = await ask(sameFactPrompt(a.type, a.content, b.content), 5);
     if (!same) throw new Error("merge model gave no answer");
     if (!isYes(same)) return null;
+    // Second lock: never merge two versions of a fact that changed. Without Clef, Llama's answer decides alone.
+    const conflict = await this.judgeConflicts([{ a: a.content, b: b.content }]);
+    if (conflict && conflict[0] >= CLEF_MIN_CONFLICT) {
+      this.audit("merge_refused", b.id, "system", { with: a.id, reason: "contradiction", conflict: Number(conflict[0].toFixed(4)) });
+      return null;
+    }
     // The fuller memory as it is, if it already holds everything; otherwise a merged one.
     const [short, long] = a.content.length <= b.content.length ? [a, b] : [b, a];
     if (!lostDetails(short.content, long.content).length && isNothingMissing(await ask(mergeCheckPrompt(a.content, b.content, long.content), 600)))

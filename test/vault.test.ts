@@ -911,6 +911,21 @@ describe("merging repeats in the background", () => {
     }
   });
 
+  it("never merges a pair Clef finds contradicting, even if the merge model says yes", async () => {
+    const changed = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz, on Main Street in Denver");
+    changed.h.state.merge = answers({});
+    changed.h.state.clef = (_s, questions) => Object.fromEntries(Object.keys(questions).map((k) => [k, 0.97]));
+    await changed.h.vault.alarm();
+    expect([status(changed.h, changed.a), status(changed.h, changed.b)]).toEqual(["active", "active"]);
+    expect(changed.h.db.prepare(`SELECT details FROM audit WHERE action = 'merge_refused'`).all()).toHaveLength(1);
+
+    const agree = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz, on Main Street in Denver");
+    agree.h.state.merge = answers({});
+    agree.h.state.clef = (_s, questions) => Object.fromEntries(Object.keys(questions).map((k) => [k, 0.02]));
+    await agree.h.vault.alarm();
+    expect([status(agree.h, agree.a), status(agree.h, agree.b)]).toEqual(["superseded", "active"]);
+  });
+
   it("retries when the model is down and waits for a memory's embedding", async () => {
     const { h, b } = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz on Main Street");
     h.state.merge = () => { throw new Error("merge model unavailable"); };
