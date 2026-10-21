@@ -1143,6 +1143,7 @@ describe("full backup and restore (review #5)", () => {
     expect(await dst.vault.restore({ ...good, version: 99 })).toMatchObject({ ok: false, error: expect.stringMatching(/version 99/) });
     expect(await dst.vault.restore({ ...good, memories: [{ ...good.memories[0], status: "deleted" }] })).toMatchObject({ ok: false, error: "memories[0] is malformed" });
     expect(await dst.vault.restore({ ...good, memories: [good.memories[0], good.memories[0]] })).toMatchObject({ ok: false, error: expect.stringMatching(/duplicate memory id/) });
+    expect(await dst.vault.restore({ ...good, memories: [{ ...good.memories[0], id: "x');alert(1);('" }] })).toMatchObject({ ok: false, error: "memories[0] is malformed" });
 
     const mine = await dst.vault.remember({ content: "kept when a restore fails" });
     const before = dump(dst);

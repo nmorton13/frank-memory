@@ -133,16 +133,16 @@ function memHtml(m, pending) {
   const by = { owner: "set by you", agent: "chosen by an agent", inherited: "from the memory it replaced", source: "from its source repo", model: "labeled in the background" }[m.area_source] || "not labeled yet";
   return '<div class="mem" data-id="' + esc(m.id) + '">' +
     '<div class="row"><span class="pill">' + esc(m.type) + '</span><span class="pill st-' + esc(m.status) + '">' + esc(m.status) + '</span>' +
-    '<span class="pill area' + (m.area ? '' : ' general') + '" title="Area: ' + esc(m.area || "general") + ' (' + by + '). Click to change." onclick="pickArea(\'' + m.id + '\')">' + esc(m.area || "general") + '</span>' +
+    '<span class="pill area' + (m.area ? '' : ' general') + '" title="Area: ' + esc(m.area || "general") + ' (' + by + '). Click to change." onclick="pickArea(decodeURIComponent(\'' + escJs(m.id) + '\'))">' + esc(m.area || "general") + '</span>' +
     '<span class="c" style="flex:1">' + esc(m.content) + '</span></div>' +
     (m.similar_to && m.status === "proposed" ? '<div class="sim">Similar to an existing memory' + (m.similar_content == null ? ' (since removed)' : ': ' + esc(m.similar_content)) + '</div>' : '') +
     (m.similar_to && m.status === "active" && m.similar_status === "active" ? '<div class="sim">May conflict with: ' + esc(m.similar_content) + '</div>' : '') +
     '<div class="row" style="margin-top:.25rem"><span class="meta" style="flex:1">' + meta + '</span>' +
-    (pending || m.status === "proposed" ? '<button class="p" onclick="act(\'' + m.id + '\',\'approve\')">Approve</button>' +
-      (m.similar_to && m.similar_content != null ? '<button class="p" title="Approve this and mark the similar memory superseded" onclick="act(\'' + m.id + '\',\'approve\',1)">Approve &amp; replace old</button>' : '') +
-      '<button onclick="act(\'' + m.id + '\',\'reject\')">Reject</button>' : '') +
-    '<button onclick="edit(\'' + m.id + '\')">Edit</button><button class="d" onclick="del(\'' + m.id + '\')">Delete</button>' +
-    '<button class="d" title="Delete and block re-import" onclick="forget(\'' + m.id + '\')">Forget</button></div></div>';
+    (pending || m.status === "proposed" ? '<button class="p" onclick="act(decodeURIComponent(\'' + escJs(m.id) + '\'),\'approve\')">Approve</button>' +
+      (m.similar_to && m.similar_content != null ? '<button class="p" title="Approve this and mark the similar memory superseded" onclick="act(decodeURIComponent(\'' + escJs(m.id) + '\'),\'approve\',1)">Approve &amp; replace old</button>' : '') +
+      '<button onclick="act(decodeURIComponent(\'' + escJs(m.id) + '\'),\'reject\')">Reject</button>' : '') +
+    '<button onclick="edit(decodeURIComponent(\'' + escJs(m.id) + '\'))">Edit</button><button class="d" onclick="del(decodeURIComponent(\'' + escJs(m.id) + '\'))">Delete</button>' +
+    '<button class="d" title="Delete and block re-import" onclick="forget(decodeURIComponent(\'' + escJs(m.id) + '\'))">Forget</button></div></div>';
 }
 const cache = {};
 function render(el, rows, pending) { rows.forEach((m) => cache[m.id] = m); $(el).innerHTML = rows.length ? rows.map((m) => memHtml(m, pending)).join("") : '<span class="muted">Nothing here.</span>'; }

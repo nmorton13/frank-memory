@@ -475,20 +475,23 @@ export function parseBackup(x: unknown): { backup: Backup } | { error: string } 
   if (o.version !== BACKUP_VERSION) return { error: `unsupported backup version ${o.version} (this vault reads version ${BACKUP_VERSION})` };
   const str = (v: unknown) => typeof v === "string";
   const opt = (v: unknown) => v === null || v === undefined || typeof v === "string";
+  // Ids end up in dashboard markup, so only the characters newId produces get in.
+  const id = (v: unknown) => typeof v === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(v);
+  const optId = (v: unknown) => v === null || v === undefined || id(v);
   const list = (name: string, ok: (r: any) => boolean): string | null => {
     if (!Array.isArray(o[name])) return `${name} must be a list`;
     const i = o[name].findIndex((r: any) => !r || typeof r !== "object" || !ok(r));
     return i === -1 ? null : `${name}[${i}] is malformed`;
   };
   const problem =
-    list("memories", (m) => str(m.id) && m.id && str(m.content) && m.content.trim() && STORED_TYPES.includes(m.type) &&
+    list("memories", (m) => id(m.id) && str(m.content) && m.content.trim() && STORED_TYPES.includes(m.type) &&
       (MEMORY_STATUSES as readonly string[]).includes(m.status) && str(m.created_at) && str(m.updated_at) &&
-      [m.supersedes, m.source, m.content_hash, m.batch_id, m.source_date, m.confirmed_at, m.similar_to, m.embedded_hash, m.embedding,
-        m.area, m.area_source, m.area_hint].every(opt)) ??
+      [m.source, m.content_hash, m.source_date, m.confirmed_at, m.embedded_hash, m.embedding,
+        m.area, m.area_source, m.area_hint].every(opt) && [m.supersedes, m.batch_id, m.similar_to].every(optId)) ??
     (o.areas === undefined ? null : list("areas", (a) => str(a.name) && Array.isArray(a.aliases) && a.aliases.every(str) && str(a.description) &&
       str(a.created_by) && str(a.created_at) && opt(a.embedding))) ??
-    list("exclusions", (e) => str(e.id) && str(e.pattern_hash) && str(e.created_at) && opt(e.description)) ??
-    list("batches", (b) => str(b.id) && str(b.created_at) && Number.isInteger(b.added) && opt(b.source) && opt(b.undone_at)) ??
+    list("exclusions", (e) => id(e.id) && str(e.pattern_hash) && str(e.created_at) && opt(e.description)) ??
+    list("batches", (b) => id(b.id) && str(b.created_at) && Number.isInteger(b.added) && opt(b.source) && opt(b.undone_at)) ??
     list("guide_history", (g) => Number.isInteger(g.version) && str(g.content) && str(g.updated_at) && opt(g.actor)) ??
     list("audit", (a) => str(a.action) && str(a.timestamp) && opt(a.memory_id) && opt(a.actor) && opt(a.details));
   if (problem) return { error: problem };
