@@ -322,3 +322,15 @@ describe("chatText", () => {
     expect(parseAreaNames("")).toBeNull();
   });
 });
+
+describe("merge guards", () => {
+  it("finds URLs, numbers, names and scope words a merge dropped", async () => {
+    const { lostDetails, isNothingMissing } = await import("../src/helpers");
+    expect(lostDetails("Sam's essay is at https://ex.com/a.html (2026).", "Sam wrote an essay in 2026.")).toEqual(["https://ex.com/a.html"]);
+    expect(lostDetails("Sam's public writing voice: no hype", "Sam's writing voice avoids hype")).toEqual(["public", "no"]);
+    expect(lostDetails("Sam joined Acme in June 2023", "Since June 2023 Sam has worked at Acme")).toEqual([]);
+    expect(isNothingMissing("Everything is there.\nNOTHING MISSING")).toBe(true);
+    expect(isNothingMissing("- the date\nSOMETHING MISSING")).toBe(false);
+    expect(isNothingMissing("Comparing the two")).toBe(false);
+  });
+});

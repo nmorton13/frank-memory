@@ -7,7 +7,7 @@ import {
   keywordStrengths, looksLikeSecret, MAX_CONTENT_LEN, MAX_GUIDE_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MemoryStatus, metadataProblem, MemoryType, MIN_SEMANTIC_SIM, parseRetentionDays, Retention, RETENTION_DEFAULTS, RETENTION_KEYS,
   retentionCutoff, sanitizeFtsQuery, scoreRecallHit, slimMemory, splitImportText, TYPE_ORDER,
   AREA_ALIAS_SIM, AREA_ALL_BUDGET_TOKENS, AREA_ALL_MAX_MEMORIES, AREA_BONUS, AREA_MIN_MEMORIES, AREA_MODEL, AreaDef, areaDescriptionPrompt, areaLabelPrompt, areasNamedIn,
-  aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
+  aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, cleanMerged, isNothingMissing, isYes, lostDetails, MERGE_MIN_SIM, MERGE_MODEL, mergeCheckPrompt, mergePrompt, sameFactPrompt, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
 } from "./helpers";
 
 export const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -44,6 +44,13 @@ const INDEX_BATCH = 100;
 const indexRetryMs = (attempts: number) => Math.min(60_000 * 2 ** Math.max(attempts - 1, 0), 60 * 60_000);
 /** Background area-labeling jobs per alarm, and attempts before one is given up (the memory stays general). */
 const AREA_JOB_BATCH = 10, AREA_JOB_MAX_ATTEMPTS = 5;
+/** Background merge checks per alarm, and attempts before one is given up (both memories stay). */
+const MERGE_JOB_BATCH = 5, MERGE_JOB_MAX_ATTEMPTS = 5, MERGE_MAX_WAIT_MS = 24 * 60 * 60_000;
+/** Memories the owner confirmed, edited or placed in an area are never merged automatically. */
+const UNTOUCHED = `confirmed_at IS NULL AND coalesce(area_source, '') != 'owner'
+  AND NOT EXISTS (SELECT 1 FROM audit u WHERE u.memory_id = memories.id AND u.action = 'update' AND u.actor = 'ui')`;
+type MergeRow = { id: string; content: string; type: string; area: string | null; source_date: string | null; created_at: string;
+  supersedes: string | null; content_hash: string; embedded_hash: string | null; embedding: ArrayBuffer | null };
 const now = () => new Date().toISOString();
 const newId = (p = "mem") => `${p}_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
 
@@ -159,6 +166,11 @@ export class MemoryVault extends DurableObject<Env> {
       this.sql.exec(`INSERT INTO operating_guide(id, content, version, updated_at) VALUES (1, ?, 1, ?)`, guide, t);
       this.sql.exec(`INSERT INTO guide_history(version, content, updated_at, actor) VALUES (1, ?, ?, 'system')`, guide, t);
     }
+    // v10: active memories that may repeat another, to be checked (and merged) in the background; checked pairs
+    // (by content hash) are remembered so a pair is asked about once.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS merge_jobs (memory_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL, last_error TEXT)`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS merge_checked (pair TEXT PRIMARY KEY, checked_at TEXT NOT NULL)`);
     if (addAreas) this.relabelAreas("backfill");
     // v8: labels from an area named in the text are no longer a rule; those memories go to the model instead.
     const named = this.sql.exec(`SELECT id FROM memories WHERE area_source = 'content'`).toArray();
@@ -507,6 +519,157 @@ export class MemoryVault extends DurableObject<Env> {
       }));
   }
 
+  // ---------- merging repeats ----------
+  /** Queue an active memory to be checked, in the background, for a repeat of another one. */
+  private queueMerge(id: string) {
+    this.sql.exec(`INSERT INTO merge_jobs(memory_id, content_hash, next_at) SELECT id, content_hash, ? FROM memories WHERE id = ? AND status = 'active'
+      ON CONFLICT(memory_id) DO UPDATE SET content_hash = excluded.content_hash, attempts = 0, next_at = excluded.next_at, last_error = NULL`, now(), id);
+  }
+
+  private mergeRow(id: string): MergeRow | null {
+    return (this.sql.exec(`SELECT id, content, type, area, source_date, created_at, supersedes, content_hash, embedded_hash, embedding
+      FROM memories WHERE id = ? AND status = 'active' AND ${UNTOUCHED}`, id).toArray()[0] as unknown as MergeRow) ?? null;
+  }
+
+  /** The most similar other active memory of the same type and area, if it is close enough to be a repeat. */
+  private closestRepeat(m: MergeRow): MergeRow | null {
+    const vec = new Float32Array(m.embedding!);
+    let best: { row: MergeRow; sim: number } | null = null;
+    for (const r of this.sql.exec(`SELECT id, content, type, area, source_date, created_at, supersedes, content_hash, embedded_hash, embedding
+        FROM memories WHERE status = 'active' AND type = ? AND area IS ? AND id != ? AND embedding IS NOT NULL AND embedded_hash = content_hash
+        AND ${UNTOUCHED} AND id NOT IN (SELECT memory_id FROM area_jobs)`, m.type, m.area, m.id)) {
+      const sim = cosine(vec, new Float32Array(r.embedding as ArrayBuffer));
+      if (sim >= MERGE_MIN_SIM && (!best || sim > best.sim)) best = { row: r as unknown as MergeRow, sim };
+    }
+    return best?.row ?? null;
+  }
+
+  /**
+   * Check queued memories for repeats (alarm) and replace each repeat pair with one memory, keeping both in history.
+   * MERGE_MODEL decides and writes; a merge that loses a detail or fails the final check leaves both memories as they are.
+   */
+  private async mergeInBackground() {
+    const jobs = this.sql.exec(`SELECT memory_id, content_hash, attempts FROM merge_jobs WHERE next_at <= ? ORDER BY next_at LIMIT ?`,
+      now(), MERGE_JOB_BATCH).toArray();
+    if (!jobs.length) return;
+    const run = `merge-${now()}`;
+    const changed: string[] = [];
+    for (const j of jobs) {
+      const id = j.memory_id as string, hash = j.content_hash as string;
+      const done = () => this.sql.exec(`DELETE FROM merge_jobs WHERE memory_id = ? AND content_hash = ?`, id, hash);
+      const m = this.mergeRow(id);
+      if (!m || m.content_hash !== hash) { done(); continue; }
+      // Wait (without counting it as a failure, for up to a day) until the memory is embedded and its area is
+      // settled, so it is compared within the right area.
+      if (m.embedded_hash !== m.content_hash || this.sql.exec(`SELECT 1 FROM area_jobs WHERE memory_id = ?`, id).toArray().length) {
+        if (Date.now() - Date.parse(m.created_at) > MERGE_MAX_WAIT_MS) done();
+        else this.sql.exec(`UPDATE merge_jobs SET next_at = ?, last_error = ? WHERE memory_id = ?`,
+          new Date(Date.now() + 60_000).toISOString(), "waiting for its embedding or area", id);
+        continue;
+      }
+      const other = this.closestRepeat(m);
+      const pair = other && [m.content_hash, other.content_hash].sort().join(":");
+      if (!other || this.sql.exec(`SELECT 1 FROM merge_checked WHERE pair = ?`, pair).toArray().length) { done(); continue; }
+      try {
+        const content = await this.askMerge(m, other);
+        const mergedHash = content === null ? null : await contentHash(content);
+        // Only if neither memory changed while the model was answering.
+        const a = this.mergeRow(m.id), b = this.mergeRow(other.id);
+        if (content !== null && a?.content_hash === m.content_hash && b?.content_hash === other.content_hash)
+          changed.push(...this.applyMerge(a, b, content, mergedHash!, run));
+        this.sql.exec(`INSERT OR IGNORE INTO merge_checked(pair, checked_at) VALUES (?, ?)`, pair, now());
+        done();
+      } catch (e) { this.retryMerge(id, j.attempts as number, (e as Error).message); }
+    }
+    if (changed.length) await this.syncIndex(changed);
+  }
+
+  private retryMerge(id: string, attempts: number, error: string) {
+    if (attempts + 1 >= MERGE_JOB_MAX_ATTEMPTS) {
+      this.sql.exec(`DELETE FROM merge_jobs WHERE memory_id = ?`, id);
+      this.audit("merge_gave_up", id, "system", { error });
+    } else this.sql.exec(`UPDATE merge_jobs SET attempts = ?, next_at = ?, last_error = ? WHERE memory_id = ?`,
+      attempts + 1, new Date(Date.now() + indexRetryMs(attempts + 1)).toISOString(), error, id);
+  }
+
+  /** Ask MERGE_MODEL whether two memories repeat one fact, and for the memory that replaces both (null: keep both). */
+  private async askMerge(a: MergeRow, b: MergeRow): Promise<string | null> {
+    const ask = async (content: string, max: number) => chatText(await withTimeout(this.env.AI.run(MERGE_MODEL as any, {
+      messages: [{ role: "user", content }], max_tokens: max, temperature: 0,
+    }), AI_TIMEOUT_MS, "merge model"));
+    const same = await ask(sameFactPrompt(a.type, a.content, b.content), 5);
+    if (!same) throw new Error("merge model gave no answer");
+    if (!isYes(same)) return null;
+    // The fuller memory as it is, if it already holds everything; otherwise a merged one.
+    const [short, long] = a.content.length <= b.content.length ? [a, b] : [b, a];
+    if (!lostDetails(short.content, long.content).length && isNothingMissing(await ask(mergeCheckPrompt(a.content, b.content, long.content), 600)))
+      return long.content;
+    const merged = cleanMerged(await ask(mergePrompt(a.content, b.content), 600));
+    if (!merged || merged.length > MAX_CONTENT_LEN || looksLikeSecret(merged)) return null;
+    if (lostDetails(a.content, merged).length || lostDetails(b.content, merged).length) return null;
+    return isNothingMissing(await ask(mergeCheckPrompt(a.content, b.content, merged), 600)) ? merged : null;
+  }
+
+  /** Replace two repeats with one: the fuller memory as it is, or a new merged one. Returns the ids to re-index. */
+  private applyMerge(a: MergeRow, b: MergeRow, content: string, hash: string, run: string): string[] {
+    const kept = content === a.content ? a : content === b.content ? b : null;
+    if (kept) {
+      const other = kept === a ? b : a;
+      if (!kept.supersedes) this.sql.exec(`UPDATE memories SET supersedes = ? WHERE id = ?`, other.id, kept.id);
+      this.markSuperseded(other.id, kept.id, "system");
+      this.audit("merge", kept.id, "system", { run, into: kept.id, from: [other.id], kept: true });
+      return [other.id];
+    }
+    if (this.findByHash(hash) || this.isExcluded(hash)) return [];
+    const [older, newer] = a.created_at <= b.created_at ? [a, b] : [b, a];
+    const id = newId(); const t = now();
+    const sourceDate = [a.source_date, b.source_date].filter(Boolean).sort().pop() ?? null;
+    // It replaces the older one (so it keeps that one's area, which both share) and retires the newer one too.
+    this.sql.exec(`INSERT INTO memories(id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at, created_at, updated_at)
+      VALUES (?, ?, ?, 'active', ?, ?, ?, NULL, ?, NULL, ?, ?)`, id, content, a.type, older.id, `merged from ${older.id} and ${newer.id}`, hash, sourceDate, t, t);
+    this.markSuperseded(older.id, id, "system");
+    this.markSuperseded(newer.id, id, "system");
+    this.labelArea(id, { run });
+    this.audit("merge", id, "system", { run, into: id, from: [older.id, newer.id] });
+    this.queueIndex([id]);
+    // The merged memory may repeat a third one.
+    this.queueMerge(id);
+    return [id, older.id, newer.id];
+  }
+
+  /** Recent automatic merges, newest first, with the memories involved. */
+  async listMerges(limit = 20) {
+    const text = (id: string) => (this.sql.exec(`SELECT content FROM memories WHERE id = ?`, id).toArray()[0]?.content as string | undefined) ?? null;
+    return this.sql.exec(`SELECT id, details, timestamp FROM audit WHERE action = 'merge' ORDER BY id DESC LIMIT ?`, limit).toArray().map((r) => {
+      const d = JSON.parse(r.details as string) as { into: string; from: string[]; kept?: boolean; undone?: string };
+      return {
+        id: r.id as number, at: r.timestamp as string, kept: !!d.kept, undone: d.undone ?? null,
+        into: { id: d.into, content: text(d.into) }, from: d.from.map((id) => ({ id, content: text(id) })),
+      };
+    });
+  }
+
+  /**
+   * Undo an automatic merge: the replaced memories become active again and a merged memory is removed, unless any of
+   * them changed since. The pair stays checked, so it isn't merged again.
+   */
+  async undoMerge(mergeId: number, actor = "ui") {
+    const r = this.sql.exec(`SELECT details FROM audit WHERE id = ? AND action = 'merge'`, mergeId).toArray()[0];
+    if (!r) return { ok: false, error: "merge not found" };
+    const d = JSON.parse(r.details as string) as { into: string; from: string[]; kept?: boolean; undone?: string };
+    if (d.undone) return { ok: false, error: "this merge was already undone" };
+    if (this.get(d.into)?.status !== "active" || d.from.some((id) => this.get(id)?.status !== "superseded"))
+      return { ok: false, error: "these memories changed after the merge, so it can't be undone automatically" };
+    const t = now();
+    for (const id of d.from) this.sql.exec(`UPDATE memories SET status = 'active', updated_at = ? WHERE id = ?`, t, id);
+    if (d.kept) this.sql.exec(`UPDATE memories SET supersedes = NULL WHERE id = ? AND supersedes IN (${d.from.map(() => "?").join(",")})`, d.into, ...d.from);
+    else this.sql.exec(`DELETE FROM memories WHERE id = ?`, d.into);
+    this.sql.exec(`DELETE FROM merge_jobs WHERE memory_id = ?`, d.into);
+    this.sql.exec(`UPDATE audit SET details = json_set(details, '$.undone', ?) WHERE id = ?`, t, mergeId);
+    this.audit("merge_undo", d.into, actor, { merge: mergeId, restored: d.from });
+    return { ok: true, restored: d.from.length, ...(await this.indexNow([d.into, ...d.from])) };
+  }
+
   // ---------- internals ----------
   private audit(action: string, memoryId: string | null, actor = "system", details?: unknown) {
     this.sql.exec(`INSERT INTO audit(action, memory_id, actor, details, timestamp) VALUES (?, ?, ?, ?, ?)`,
@@ -632,10 +795,11 @@ export class MemoryVault extends DurableObject<Env> {
       : { indexed: r.indexed };
   }
 
-  /** Alarm at the earlier of the next daily cleanup and the next due index or area job (or an area to describe). */
+  /** Alarm at the earlier of the next daily cleanup and the next due index, area or merge job (or an area to describe). */
   private async scheduleAlarm() {
     const cleanupAt = this.nextCleanupAt();
     const jobAt = this.sql.exec(`SELECT MIN(t) AS t FROM (SELECT MIN(next_at) AS t FROM index_jobs UNION ALL SELECT MIN(next_at) FROM area_jobs
+        UNION ALL SELECT MIN(next_at) FROM merge_jobs
         UNION ALL SELECT CASE WHEN EXISTS (SELECT 1 FROM areas WHERE embedding IS NULL) THEN ? END)`,
       new Date(Date.now() + 60_000).toISOString()).one().t as string | null;
     const at = jobAt ? Math.min(cleanupAt, Math.max(Date.parse(jobAt), Date.now() + 1000)) : cleanupAt;
@@ -729,6 +893,7 @@ export class MemoryVault extends DurableObject<Env> {
     if (supersedes && status === "active") this.markSuperseded(supersedes, id, actor);
     this.audit("remember", id, actor, { type, status, supersedes });
     this.labelArea(id, { explicit: input.area });
+    this.queueMerge(id);
     this.promoteAreas();
     const area = this.get(id)?.area ?? null;
     const idx = await this.indexNow(supersedes ? [id, supersedes] : [id]);
@@ -831,6 +996,7 @@ export class MemoryVault extends DurableObject<Env> {
         vecs ? new Float32Array(vecs[i]).buffer : null, vecs ? c.hash : null);
       if (similarTo) review.push({ id, similar_to: similarTo, similarity });
       this.labelArea(id, { areas, run: batchId });
+      this.queueMerge(id);
       inserted.push({ id, type, status, content: c.content });
       // Later items in the same batch are compared against this one too.
       if (unit) pool.push({ id, content: c.content, vec: unit });
@@ -1325,7 +1491,7 @@ export class MemoryVault extends DurableObject<Env> {
     const restored = { memories: memories.length, exclusions: b.exclusions.length, batches: b.batches.length, audit: b.audit.length, guide_version: b.guide.version };
     try {
       this.ctx.storage.transactionSync(() => {
-        for (const table of ["memories", "exclusions", "batches", "guide_history", "audit", "index_jobs", "area_jobs", "areas"]) this.sql.exec(`DELETE FROM ${table}`);
+        for (const table of ["memories", "exclusions", "batches", "guide_history", "audit", "index_jobs", "area_jobs", "areas", "merge_jobs", "merge_checked"]) this.sql.exec(`DELETE FROM ${table}`);
         this.sql.exec(`DELETE FROM settings WHERE key NOT IN (${LOCAL_SETTINGS.map(() => "?").join(",")})`, ...LOCAL_SETTINGS);
         for (const m of memories)
           this.sql.exec(`INSERT INTO memories(id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at,
@@ -1370,6 +1536,7 @@ export class MemoryVault extends DurableObject<Env> {
     try {
       await this.syncIndex();
       await this.labelAreasInBackground();
+      await this.mergeInBackground();
       if (Date.now() >= this.nextCleanupAt()) {
         this.sql.exec(`UPDATE settings SET value = ? WHERE key = 'next_cleanup_at'`, String(Date.now() + CLEANUP_EVERY_MS));
         await this.cleanup();

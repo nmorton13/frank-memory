@@ -628,3 +628,88 @@ export function chatText(r: unknown): string {
   if (typeof o?.response === "string") return o.response.trim();
   return o?.response === undefined || o?.response === null ? "" : JSON.stringify(o.response);
 }
+
+// ---------- merging repeats ----------
+/**
+ * Model that decides whether two memories repeat the same fact and writes the merged memory. Larger than AREA_MODEL
+ * because it is asked rarely (only for close pairs) and a wrong merge costs more: on a real vault (2026-10-21)
+ * Mistral Small also glued separate facts together, and Llama 3.3 70B made no wrong merges.
+ */
+export const MERGE_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+/** Pairs at least this similar are checked. On a real vault the repeats scored 0.70-0.96 and look-alikes down to 0.63. */
+export const MERGE_MIN_SIM = 0.68;
+
+export function sameFactPrompt(type: string, a: string, b: string): string {
+  return `A personal memory vault sometimes stores the same fact twice in different words, for example because two AI assistants each saved it. Decide whether these two memories (both of type ${type}) are such a repeat.
+
+A: """${a}"""
+B: """${b}"""
+
+Answer Yes only if A and B are about the same single thing and repeat at least part of what they say about it: the same fact told twice, or one a fuller version of the other.
+Answer No if:
+- each covers a different part of the subject, so both could stand alone (two devices, a job and separate work done in that job, a router's model and its DNS setting, a project and its code's status);
+- they are two separate rules or preferences, even on a related topic;
+- they are two decisions or choices, even about the same system, unless one plainly restates the other;
+- one gives a reason, date or detail the other lacks and would lose if only the other were kept;
+- they disagree about anything (a date, number, name, amount or choice);
+- you are unsure.
+Answer Yes or No.`;
+}
+
+export function mergePrompt(a: string, b: string): string {
+  return `These two memories from a personal memory vault say the same thing in different words:
+
+A: """${a}"""
+B: """${b}"""
+
+Write one memory that replaces both: standalone, in the same style, keeping every detail from either one and adding nothing. Answer with only the memory.`;
+}
+
+/**
+ * Last check before two memories are replaced by one (the merged text, or the fuller of the two). It asks for what is
+ * missing rather than for a yes: on a real vault a yes/no check passed merges that dropped "public" from a writing
+ * rule and "policy chatbot" from a job.
+ */
+export function mergeCheckPrompt(a: string, b: string, replacement: string): string {
+  return `A personal memory vault wants to replace two memories with one.
+
+A: """${a}"""
+B: """${b}"""
+Replacement: """${replacement}"""
+
+Compare them word by word. Briefly list every fact, reason, name, number, limit, exception or scope word (such as "public", "only", "never", "all") from A or B that is missing or changed in the replacement, and anything it adds that is in neither. A different wording for the same meaning is fine.
+End with a last line that is exactly NOTHING MISSING or SOMETHING MISSING.`;
+}
+
+/** True when the final merge check ended with its NOTHING MISSING verdict. */
+export function isNothingMissing(answer: string): boolean {
+  const last = answer.trim().split("\n").pop() ?? "";
+  return /^\W*nothing missing\W*$/i.test(last);
+}
+
+export function isYes(answer: string): boolean {
+  return /^\W*yes\b/i.test(answer);
+}
+
+/** A written merge without wrapping quotes. */
+export function cleanMerged(text: string): string {
+  return text.trim().replace(/^("""|"|“)/, "").replace(/("""|"|”)$/, "").trim();
+}
+
+/** Words that set a rule's scope or turn it around; a merge must keep each one either memory has. */
+const SCOPE_WORDS = ["public", "private", "only", "never", "always", "all", "every", "no", "not", "none", "except", "unless", "without", "must", "hard"];
+
+/**
+ * URLs, numbers, capitalized words (names) and scope words of `from` that `into` lacks. A merge that loses one is
+ * refused: on a real vault the model dropped an essay's URL and two dates and still judged its merge complete, and
+ * once folded a "public writing voice" rule into a job-application one by dropping "public".
+ */
+export function lostDetails(from: string, into: string): string[] {
+  const have = into.toLowerCase();
+  const words = new Set(have.match(/[\p{L}\p{N}']+/gu) ?? []);
+  const details = (from.match(/https?:\/\/\S+|\p{Lu}[\p{L}\p{N}.'’-]*|\d[\d.,:%$KkMm–-]*/gu) ?? [])
+    .map((t) => t.toLowerCase().replace(/[.,;:)\]"'”]+$/, "").replace(/['’]s$/, ""))
+    .filter((t) => t.length > 1);
+  const scope = (from.toLowerCase().match(/[\p{L}']+/gu) ?? []).filter((w) => SCOPE_WORDS.includes(w) && !words.has(w));
+  return [...new Set([...details.filter((d) => !have.includes(d)), ...scope])];
+}

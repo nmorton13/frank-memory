@@ -85,6 +85,8 @@ async function api(req: Request, url: URL, vault: DurableObjectStub<MemoryVault>
   if ((r = p.match(/^\/areas\/([\w-]+)\/unblock$/)) && m === "POST") return json(await vault.unblockArea(r[1], "ui"));
   if ((r = p.match(/^\/areas\/([\w-]+)$/)) && m === "DELETE") return json(await vault.removeArea(r[1], "ui"));
   if (p === "/areas/undo-run" && m === "POST") return json(await vault.undoAreaRun(String((await body()).run ?? ""), "ui"));
+  if (p === "/merges" && m === "GET") return json(await vault.listMerges());
+  if (p === "/merges/undo" && m === "POST") return json(await vault.undoMerge(Number((await body()).id), "ui"));
   if (p === "/bulk" && m === "POST") {
     const b = await body();
     return json(await vault.bulkRemember({ items: Array.isArray(b.items) ? b.items : undefined, text: b.text, source: b.source ?? "ui paste", actor: "ui" }));

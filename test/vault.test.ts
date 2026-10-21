@@ -830,6 +830,103 @@ describe("v4 migration on an existing vault", () => {
   });
 });
 
+describe("merging repeats in the background", () => {
+  /** An auto-mode vault where `b` is saved as a close neighbour of `a` (cosine `sim`). */
+  async function pair(a: string, b: string, opts: { sim?: number; typeB?: string; actorB?: string } = {}) {
+    const h = createVault({ approvalMode: "auto" });
+    h.embedAs(b, vectorNear(h.embeddingOf(a), opts.sim ?? 0.85));
+    const ma = await h.vault.remember({ content: a, type: "fact" });
+    const mb = await h.vault.remember({ content: b, type: opts.typeB ?? "fact", ...(opts.actorB ? { actor: opts.actorB, status: "active" } : {}) });
+    return { h, a: ma.id as string, b: mb.id as string };
+  }
+  const status = (h: ReturnType<typeof createVault>, id: string) => h.rows("id = ?", id)[0]?.status;
+  /** Merge-model answers: same fact, the fuller one keeps everything (or not), the written merge, the final check. */
+  const answers = (o: { same?: string; check?: (replacement: string) => string; merged?: string }) => (p: string) =>
+    p.startsWith("A personal memory vault sometimes") ? o.same ?? "Yes."
+    : p.startsWith("A personal memory vault wants") ? (o.check ?? (() => "Nothing differs.\nNOTHING MISSING"))(p.split('Replacement: """')[1].split('"""')[0])
+    : o.merged ?? "";
+
+  it("keeps the fuller memory when it already holds everything", async () => {
+    const { h, a, b } = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz, on Main Street in Denver");
+    h.state.merge = answers({});
+    await h.vault.alarm();
+    expect([status(h, a), status(h, b)]).toEqual(["superseded", "active"]);
+    expect(await h.vault.listMerges()).toMatchObject([{ kept: true, into: { id: b }, from: [{ id: a }] }]);
+  });
+
+  /** A final check that, like the real one, only passes text keeping both facts. */
+  const keepsBoth = (r: string) => (r.includes("designer") && r.includes("2020") ? "NOTHING MISSING" : "- the other fact\nSOMETHING MISSING");
+
+  it("writes one memory that replaces both, and undo brings both back", async () => {
+    const { h, a, b } = await pair("Sam works at Acme as a designer", "Sam has been at Acme since 2020");
+    h.state.merge = answers({ merged: '"Sam has worked at Acme as a designer since 2020."', check: keepsBoth });
+    await h.vault.alarm();
+    const merged = h.rows("status = 'active'");
+    expect(merged.map((m) => m.content)).toEqual(["Sam has worked at Acme as a designer since 2020."]);
+    expect([status(h, a), status(h, b)]).toEqual(["superseded", "superseded"]);
+    expect(merged[0]).toMatchObject({ supersedes: a });
+    expect(await h.vault.getMemory(merged[0].id)).toMatchObject({ source: `merged from ${a} and ${b}` });
+    expect(h.vectors.has(merged[0].id)).toBe(true);
+
+    const [m] = await h.vault.listMerges();
+    expect(await h.vault.undoMerge(m.id)).toMatchObject({ ok: true, restored: 2 });
+    expect([status(h, a), status(h, b)]).toEqual(["active", "active"]);
+    expect(h.rows("id = ?", merged[0].id)).toEqual([]);
+    expect(h.vectors.has(merged[0].id)).toBe(false);
+    expect(await h.vault.undoMerge(m.id)).toMatchObject({ ok: false });
+    // The pair was checked, so it is not merged again.
+    await h.vault.remember({ content: "Sam works at Acme as a designer", type: "fact", supersedes: undefined });
+    await h.vault.alarm();
+    expect([status(h, a), status(h, b)]).toEqual(["active", "active"]);
+  });
+
+  it("keeps both when the model says they are different, or a merge loses a detail or fails the check", async () => {
+    const no = await pair("Sam's garage node is at .166", "Sam's basement node is at .165");
+    await no.h.vault.alarm(); // default answer: No
+    expect([status(no.h, no.a), status(no.h, no.b)]).toEqual(["active", "active"]);
+
+    const lossy = await pair("Sam works at Acme as a designer", "Sam has been at Acme since 2020");
+    lossy.h.state.merge = answers({ merged: "Sam works at Acme as a designer.", check: keepsBoth });
+    await lossy.h.vault.alarm();
+    expect([status(lossy.h, lossy.a), status(lossy.h, lossy.b)]).toEqual(["active", "active"]);
+
+    const failed = await pair("Sam works at Acme as a designer", "Sam has been at Acme since 2020");
+    failed.h.state.merge = answers({ merged: "Sam has worked at Acme as a designer since 2020.", check: () => "- \"designer\" changed\nSOMETHING MISSING" });
+    await failed.h.vault.alarm();
+    expect([status(failed.h, failed.a), status(failed.h, failed.b)]).toEqual(["active", "active"]);
+    expect(await failed.h.vault.listMerges()).toEqual([]);
+  });
+
+  it("never merges across types or memories the owner wrote or edited, and asks nothing for distant pairs", async () => {
+    const types = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz on Main Street", { typeB: "note" });
+    const owner = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz on Main Street", { actorB: "ui" });
+    const far = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz on Main Street", { sim: 0.5 });
+    const edited = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz on Main Street");
+    await edited.h.vault.updateMemory(edited.b, { content: "Sam's dentist is Dr. Ortiz on Main St" });
+    for (const t of [types, owner, far, edited]) {
+      t.h.state.merge = answers({});
+      await t.h.vault.alarm();
+      expect(t.h.state.prompts.filter((p) => p.startsWith("A personal memory vault sometimes"))).toEqual([]);
+      expect(t.h.rows("status = 'superseded'")).toEqual([]);
+    }
+  });
+
+  it("retries when the model is down and waits for a memory's embedding", async () => {
+    const { h, b } = await pair("Sam's dentist is Dr. Ortiz", "Sam's dentist is Dr. Ortiz on Main Street");
+    h.state.merge = () => { throw new Error("merge model unavailable"); };
+    await h.vault.alarm();
+    expect(h.mergeJobs()).toEqual(expect.arrayContaining([expect.objectContaining({ memory_id: b, attempts: 1 })]));
+
+    const late = createVault({ approvalMode: "auto" });
+    late.state.aiDown = true;
+    const m = await late.vault.remember({ content: "Sam's dentist is Dr. Ortiz", type: "fact" });
+    late.state.aiDown = false;
+    late.state.vectorizeDown = true; // the alarm can't index it yet
+    await late.vault.alarm();
+    expect(late.mergeJobs()).toEqual([expect.objectContaining({ memory_id: m.id, last_error: "waiting for its embedding or area" })]);
+  });
+});
+
 describe("v9 migration: stemmed keyword search", () => {
   it("rebuilds an unstemmed index so other word forms match", async () => {
     const old = createVault({ approvalMode: "auto" });

@@ -62,6 +62,9 @@
     <div id="areas" class="muted">Loading…</div>
     <div id="removed" class="meta" style="margin-top:.4rem"></div>
     <h2 style="margin-top:1rem">Recent automatic labeling</h2><div id="runs" class="muted"></div>
+    <h2 style="margin-top:1rem">Recent automatic merges</h2>
+    <p class="meta" style="margin-top:0">When two memories repeat the same fact (often saved by two different agents), they are replaced by one. The originals stay in history, and Undo brings them back.</p>
+    <div id="merges" class="muted"></div>
   </section>
 
   <section>
@@ -252,7 +255,18 @@ async function undoRun(run) {
   if (!confirm("Put the memories this run labeled back the way they were? Those labels then count as yours.")) return;
   const r = await call("/areas/undo-run", "POST", { run: decodeURIComponent(run) }); if (r.ok) toast("Restored " + r.restored + " memories"); refresh();
 }
-async function refresh() { await Promise.all([loadSettings(), loadPending(), loadAreas(), loadList(), loadBatches()]); }
+async function loadMerges() {
+  const r = await call("/merges");
+  $("merges").innerHTML = r.length ? r.map((x) => '<div class="mem"><div class="row"><span style="flex:1">' + (x.kept ? 'Kept the fuller one' : 'Merged') + ' · ' + fmt(x.at) + (x.undone ? ' · undone' : '') + '</span>' +
+    (x.undone ? '' : '<button class="d" onclick="undoMerge(' + Number(x.id) + ')">Undo</button>') + '</div>' +
+    x.from.map((f) => '<div class="meta">− ' + esc(f.content ?? "(removed)") + '</div>').join("") +
+    '<div class="meta">+ ' + esc(x.into.content ?? "(removed)") + '</div></div>').join("") : "Nothing yet.";
+}
+async function undoMerge(id) {
+  if (!confirm("Bring back the original memories and remove the merged one?")) return;
+  const r = await call("/merges/undo", "POST", { id }); toast(r.ok ? "Restored " + r.restored + " memories" : r.error); refresh();
+}
+async function refresh() { await Promise.all([loadSettings(), loadPending(), loadAreas(), loadMerges(), loadList(), loadBatches()]); }
 
 async function act(id, a, replace) { const r = await call("/memories/" + id + "/" + a + (replace ? "?supersede_similar=1" : ""), "POST"); if (r.ok) toast(replace ? "Approved; old memory superseded" : a + "d"); refresh(); }
 async function del(id) { if (confirm("Delete this memory?")) { await call("/memories/" + id, "DELETE"); refresh(); } }

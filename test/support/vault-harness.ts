@@ -3,6 +3,7 @@
 // (https://developers.cloudflare.com/durable-objects/platform/limits/).
 import { DatabaseSync } from "node:sqlite";
 import { MemoryVault } from "../../src/vault";
+import { MERGE_MODEL } from "../../src/helpers";
 
 const MAX_BOUND_PARAMS = 100;
 const MAX_LIKE_PATTERN_BYTES = 50;
@@ -81,11 +82,20 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
     chat: (prompt: string): string => (prompt.startsWith("These memories") ? "Work on this area" : "[]"),
     /** Answers to the yes/no checks before a memory is put into an existing area. */
     confirm: (_prompt: string): string => "Yes.",
+    /** Answers of the merge model (same fact? / merged text / final check), by prompt. Never merges by default. */
+    merge: (_prompt: string): string => "No.",
     chatDown: false, chatCalls: 0, prompts: [] as string[],
   };
 
   const AI = {
-    async run(_model: string, input: { text?: string[]; messages?: { content: string }[] }) {
+    async run(model: string, input: { text?: string[]; messages?: { content: string }[] }) {
+      if (input.messages && model === MERGE_MODEL) {
+        state.chatCalls++;
+        if (state.chatDown) throw new Error("AI unavailable");
+        const prompt = input.messages[input.messages.length - 1].content;
+        state.prompts.push(prompt);
+        return { response: state.merge(prompt) };
+      }
       if (input.messages) {
         state.chatCalls++;
         if (state.chatDown) throw new Error("AI unavailable");
@@ -141,6 +151,7 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
     makeJobsDue() { db.prepare(`UPDATE index_jobs SET next_at = ?`).run(new Date(0).toISOString()); },
     jobs() { return db.prepare(`SELECT memory_id, attempts, last_error FROM index_jobs`).all() as any[]; },
     areaJobs() { return db.prepare(`SELECT memory_id, attempts, last_error FROM area_jobs`).all() as any[]; },
+    mergeJobs() { return db.prepare(`SELECT memory_id, attempts, last_error FROM merge_jobs`).all() as any[]; },
     /** Make every queued area job due now. */
     makeAreaJobsDue() { db.prepare(`UPDATE area_jobs SET next_at = ?`).run(new Date(0).toISOString()); },
     db,
