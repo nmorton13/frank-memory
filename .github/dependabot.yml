@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm_minor_patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+      npm_security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      github_actions_minor_patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+      github_actions_security:
+        applies-to: security-updates
+        patterns: ["*"]
