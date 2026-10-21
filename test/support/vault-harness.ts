@@ -3,7 +3,7 @@
 // (https://developers.cloudflare.com/durable-objects/platform/limits/).
 import { DatabaseSync } from "node:sqlite";
 import { MemoryVault } from "../../src/vault";
-import { MERGE_MODEL } from "../../src/helpers";
+import { CLEF_MODEL, MERGE_MODEL } from "../../src/helpers";
 
 const MAX_BOUND_PARAMS = 100;
 const MAX_LIKE_PATTERN_BYTES = 50;
@@ -84,11 +84,20 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
     confirm: (_prompt: string): string => "Yes.",
     /** Answers of the merge model (same fact? / merged text / final check), by prompt. Never merges by default. */
     merge: (_prompt: string): string => "No.",
+    /** Clef: the probability for each question, given the request. Unset = Clef unavailable (recall falls back). */
+    clef: null as null | ((state: any, questions: Record<string, { instructions: string }>) => Record<string, number>),
+    clefCalls: 0,
     chatDown: false, chatCalls: 0, prompts: [] as string[],
   };
 
   const AI = {
-    async run(model: string, input: { text?: string[]; messages?: { content: string }[] }) {
+    async run(model: string, input: { text?: string[]; messages?: { content: string }[]; state?: any; questions?: any }) {
+      if (model === CLEF_MODEL) {
+        state.clefCalls++;
+        if (!state.clef) throw new Error("clef not mocked");
+        const p = state.clef(input.state, input.questions);
+        return { model: "clef", answers: Object.fromEntries(Object.entries(p).map(([k, v]) => [k, { type: "noul", noul: v }])) };
+      }
       if (input.messages && model === MERGE_MODEL) {
         state.chatCalls++;
         if (state.chatDown) throw new Error("AI unavailable");

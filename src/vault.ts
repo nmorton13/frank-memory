@@ -7,6 +7,7 @@ import {
   keywordStrengths, looksLikeSecret, MAX_CONTENT_LEN, MAX_GUIDE_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MemoryStatus, metadataProblem, MemoryType, MIN_SEMANTIC_SIM, parseRetentionDays, Retention, RETENTION_DEFAULTS, RETENTION_KEYS,
   retentionCutoff, sanitizeFtsQuery, scoreRecallHit, slimMemory, splitImportText, TYPE_ORDER,
   AREA_ALIAS_SIM, AREA_ALL_BUDGET_TOKENS, AREA_ALL_MAX_MEMORIES, AREA_BONUS, AREA_MIN_MEMORIES, AREA_MODEL, AreaDef, areaDescriptionPrompt, areaLabelPrompt, areasNamedIn,
+  CLEF_MAX, CLEF_MIN_CONFLICT, CLEF_MIN_RELEVANCE, CLEF_MODEL, CLEF_SEMANTIC_CANDIDATES, CLEF_TIMEOUT_MS, conflictQuestion, relevanceQuestion,
   aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, cleanMerged, isNothingMissing, isYes, lostDetails, MERGE_MIN_SIM, MERGE_MODEL, mergeCheckPrompt, mergePrompt, sameFactPrompt, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
 } from "./helpers";
 
@@ -25,7 +26,7 @@ export interface Memory {
   /** The project or area the memory belongs to (null = general); see pickArea. */
   area: string | null; area_source: string | null; area_hint: string | null;
 }
-export interface RecallHit extends Memory { score: number; matched: ("semantic" | "keyword")[]; similarity?: number }
+export interface RecallHit extends Memory { score: number; matched: ("semantic" | "keyword")[]; similarity?: number; relevance?: number }
 export interface ListFilters { type?: string; status?: string; batch_id?: string; q?: string; area?: string }
 
 const COLS = "id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at, created_at, updated_at, similar_to, area, area_source, area_hint, " +
@@ -1002,6 +1003,16 @@ export class MemoryVault extends DurableObject<Env> {
       if (unit) pool.push({ id, content: c.content, vec: unit });
     });
 
+    // In auto mode a similar item is flagged as a possible conflict only if Clef finds a contradiction (without Clef, all stay flagged).
+    if (auto && review.length) {
+      const text = (id: string) => (this.sql.exec(`SELECT content FROM memories WHERE id = ?`, id).toArray()[0]?.content as string) ?? "";
+      const conflict = await this.judgeConflicts(review.map((r) => ({ a: text(r.similar_to), b: text(r.id) })));
+      if (conflict) for (let i = review.length - 1; i >= 0; i--) {
+        if (conflict[i] >= CLEF_MIN_CONFLICT) continue;
+        this.sql.exec(`UPDATE memories SET similar_to = NULL WHERE id = ?`, review[i].id);
+        review.splice(i, 1);
+      }
+    }
     if (inserted.length) {
       this.sql.exec(`INSERT INTO batches(id, source, added, created_at) VALUES (?, ?, ?, ?)`, batchId, input.source ?? null, inserted.length, t);
       this.promoteAreas(batchId);
@@ -1061,7 +1072,8 @@ export class MemoryVault extends DurableObject<Env> {
     const asked = normalizeArea(input.area);
     const named = areasNamedIn(input.query ?? "", areas);
     const explicitArea = asked ? resolveArea(asked, areas) : named.length === 1 ? named[0] : null;
-    const found = await this.search({ ...input, area: explicitArea });
+    // Agent recall has Clef judge the matches; dashboard search stays on embedding-and-keyword scoring.
+    const found = await this.search({ ...input, area: explicitArea, judge: !!input.complete });
     const area = found.area;
     if (!input.complete) return { mode: found.mode, results: found.results, ...(area ? { area } : {}) };
     const results: (Memory | RecallHit)[] = [...found.results];
@@ -1083,7 +1095,7 @@ export class MemoryVault extends DurableObject<Env> {
     const general = this.wholeArea(input, null, GENERAL_ALL_BUDGET_TOKENS);
     if (general || input.type) add("general", general);
     else add("general preferences", this.wholeArea({ ...input, type: "preference" }, null, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES));
-    return { mode: found.mode, ...(area ? { area } : {}), complete, results };
+    return { mode: found.mode, ...("judged" in found ? { judged: true } : {}), ...(area ? { area } : {}), complete, results };
   }
 
   /**
@@ -1106,7 +1118,7 @@ export class MemoryVault extends DurableObject<Env> {
     return rows.sort((a, b) => rank(a.type) - rank(b.type));
   }
 
-  private async search(input: { query: string; limit?: number; type?: string; status?: string; area?: string | null }) {
+  private async search(input: { query: string; limit?: number; type?: string; status?: string; area?: string | null; judge?: boolean }) {
     const limit = Math.min(Math.max(input.limit ?? 8, 1), 50);
     const query = (input.query ?? "").trim();
     if (!query) return { mode: "none", results: [] as RecallHit[] };
@@ -1160,6 +1172,26 @@ export class MemoryVault extends DurableObject<Env> {
         .map((r) => ({ id: r.id as string, bm25: Number(r.bm25) }));
     }
     const keyword = keywordStrengths(keywordRows);
+    if (input.judge) {
+      // Clef judges a loose candidate set (the closest by meaning with no cutoff, plus keyword hits); if it is
+      // unavailable, the scoring below is used instead.
+      const loose = [...sims.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id).filter(eligible).slice(0, CLEF_SEMANTIC_CANDIDATES);
+      const ids = [...new Set([...loose, ...[...keyword.keys()].filter(eligible)])].slice(0, CLEF_MAX);
+      const relevance = await this.judgeRelevance(query, ids.map((id) => rows.get(id)!));
+      if (relevance) {
+        const hits: RecallHit[] = ids.filter((id) => relevance.get(id)! >= CLEF_MIN_RELEVANCE)
+          .sort((a, b) => relevance.get(b)! - relevance.get(a)!)
+          .map((id) => {
+            const m = rows.get(id)!, p = relevance.get(id)!;
+            const matched: RecallHit["matched"] = [];
+            if ((sims.get(id) ?? 0) >= MIN_SEMANTIC_SIM) matched.push("semantic");
+            if (keyword.has(id)) matched.push("keyword");
+            const similarity = sims.has(id) ? Number(sims.get(id)!.toFixed(4)) : undefined;
+            return { ...m, matched, similarity, relevance: Number(p.toFixed(4)), score: Number(p.toFixed(4)) };
+          }).slice(0, limit);
+        return { mode: semanticOk ? "hybrid" : "keyword-only", judged: true, area: input.area ?? dominantArea(hits), results: hits };
+      }
+    }
     const semanticSet = new Set(semantic);
     const candidates: { m: Memory; matched: RecallHit["matched"]; similarity?: number; baseScore: number }[] = [];
     for (const id of new Set([...semantic, ...keyword.keys()])) {
@@ -1183,6 +1215,51 @@ export class MemoryVault extends DurableObject<Env> {
     });
     hits.sort((a, b) => b.score - a.score);
     return { mode: semanticOk ? "hybrid" : "keyword-only", area, results: hits.slice(0, limit) };
+  }
+
+  /** Clef's probability that each memory helps answer the query, or null if Clef is unavailable. */
+  private async judgeRelevance(query: string, ms: Memory[]): Promise<Map<string, number> | null> {
+    if (!ms.length) return new Map();
+    try {
+      const r = (await withTimeout(this.env.AI.run(CLEF_MODEL as any, {
+        model: "clef",
+        state: { question: query, memories: Object.fromEntries(ms.map((m, i) => [`m${i}`, m.content])) },
+        questions: Object.fromEntries(ms.map((_, i) => [`m${i}`, { type: "noul", instructions: relevanceQuestion(`m${i}`) }])),
+      }), CLEF_TIMEOUT_MS, "clef")) as { answers?: Record<string, { noul?: unknown }> };
+      const out = new Map<string, number>();
+      for (const [i, m] of ms.entries()) {
+        const p = r?.answers?.[`m${i}`]?.noul;
+        if (typeof p !== "number") throw new Error("clef gave no answer");
+        out.set(m.id, p);
+      }
+      return out;
+    } catch (e) {
+      console.warn("clef unavailable, recall uses scoring:", (e as Error).message);
+      return null;
+    }
+  }
+
+  /** Clef's probability that each pair contradicts itself, or null if Clef is unavailable. */
+  private async judgeConflicts(pairs: { a: string; b: string }[]): Promise<number[] | null> {
+    try {
+      const out: number[] = [];
+      for (const part of chunk(pairs, CLEF_MAX)) {
+        const r = (await withTimeout(this.env.AI.run(CLEF_MODEL as any, {
+          model: "clef",
+          state: { pairs: Object.fromEntries(part.map((p, i) => [`p${i}`, { memory_a: p.a, memory_b: p.b }])) },
+          questions: Object.fromEntries(part.map((_, i) => [`p${i}`, { type: "noul", instructions: conflictQuestion(`p${i}`) }])),
+        }), CLEF_TIMEOUT_MS, "clef")) as { answers?: Record<string, { noul?: unknown }> };
+        for (const i of part.keys()) {
+          const p = r?.answers?.[`p${i}`]?.noul;
+          if (typeof p !== "number") throw new Error("clef gave no answer");
+          out.push(p);
+        }
+      }
+      return out;
+    } catch (e) {
+      console.warn("clef unavailable, similar import items stay flagged:", (e as Error).message);
+      return null;
+    }
   }
 
   async listMemories(filters: ListFilters = {}, limit = 50, offset = 0) {

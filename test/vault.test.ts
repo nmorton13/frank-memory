@@ -927,6 +927,67 @@ describe("merging repeats in the background", () => {
   });
 });
 
+describe("Clef judges agent recall", () => {
+  const ui = { actor: "ui", status: "active" } as const;
+  /** Clef answers: the probability that a memory helps, by a word in its text. */
+  const judge = (h: ReturnType<typeof createVault>, byWord: Record<string, number>) => {
+    h.state.clef = (state) => Object.fromEntries(Object.entries(state.memories as Record<string, string>)
+      .map(([k, text]) => [k, Object.entries(byWord).find(([w]) => text.includes(w))?.[1] ?? 0.02]));
+  };
+
+  it("finds a memory search scores too low, and drops ones that don't help", async () => {
+    const h = createVault();
+    const mac = await h.vault.remember({ content: "Sam's computer is a MacBook with 48 GB of memory", ...ui });
+    await h.vault.remember({ content: "Sam's router is in the hallway", ...ui });
+    judge(h, { MacBook: 0.98 });
+    const res = await h.vault.recall({ query: "What laptop do I use?", complete: true });
+    expect(res).toMatchObject({ judged: true });
+    expect(res.results[0]).toMatchObject({ id: mac.id, relevance: 0.98, score: 0.98 });
+    // Only the MacBook is a match; the router comes back only with the rest of general, unscored.
+    expect(res.results.filter((r) => "score" in r).map((r) => r.id)).toEqual([mac.id]);
+  });
+
+  it("returns no matches when nothing helps (general preferences still load)", async () => {
+    const h = createVault();
+    await h.vault.remember({ content: "Sam's router is in the hallway", ...ui });
+    const pref = await h.vault.remember({ content: "Sam prefers short answers", type: "preference", ...ui });
+    judge(h, {});
+    const res = await h.vault.recall({ query: "router hallway", complete: true });
+    expect(res.results.filter((r) => "score" in r)).toEqual([]);
+    expect(res.results.map((r) => r.id)).toContain(pref.id);
+  });
+
+  it("falls back to scoring when Clef is unavailable, and dashboard search never asks it", async () => {
+    const h = createVault();
+    const m = await h.vault.remember({ content: "Sam's router is in the hallway", ...ui });
+    const res = await h.vault.recall({ query: "router hallway", complete: true });
+    expect(res).not.toHaveProperty("judged");
+    expect(res.results[0].id).toBe(m.id);
+    judge(h, { router: 0.9 });
+    const calls = h.state.clefCalls;
+    await h.vault.recall({ query: "router hallway" });
+    expect(h.state.clefCalls).toBe(calls);
+  });
+});
+
+describe("Clef checks import conflicts", () => {
+  async function similarImport(conflict: number | null) {
+    const h = createVault({ approvalMode: "auto" });
+    const oldText = "Sam's internet is 1 Gbps fiber", newText = "Sam's internet is 2 Gbps fiber";
+    h.embedAs(newText, vectorNear(h.embeddingOf(oldText), 0.85));
+    await h.vault.remember({ content: oldText });
+    if (conflict !== null) h.state.clef = (_state, questions) => Object.fromEntries(Object.keys(questions).map((k) => [k, conflict]));
+    return h.vault.bulkRemember({ items: [newText] });
+  }
+
+  it("flags a similar item only when Clef finds a contradiction", async () => {
+    expect(await similarImport(0.97)).toMatchObject({ possible_conflicts: 1 });
+    expect(await similarImport(0.02)).toMatchObject({ possible_conflicts: 0, active: 1 });
+    // Without Clef, similar items stay flagged.
+    expect(await similarImport(null)).toMatchObject({ possible_conflicts: 1 });
+  });
+});
+
 describe("v9 migration: stemmed keyword search", () => {
   it("rebuilds an unstemmed index so other word forms match", async () => {
     const old = createVault({ approvalMode: "auto" });

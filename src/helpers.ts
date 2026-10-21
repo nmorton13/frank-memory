@@ -713,3 +713,30 @@ export function lostDetails(from: string, into: string): string[] {
   const scope = (from.toLowerCase().match(/[\p{L}']+/gu) ?? []).filter((w) => SCOPE_WORDS.includes(w) && !words.has(w));
   return [...new Set([...details.filter((d) => !have.includes(d)), ...scope])];
 }
+
+// ---------- Clef: relevance and conflict judgments ----------
+/**
+ * Cloudflare's decision model: given data and typed questions, it returns probabilities instead of text. On the live
+ * vault (2026-10-21, 105 memories) it judged a loose candidate set for recall and put the right memory first for 34 of
+ * 34 questions (embedding-and-keyword scoring: 30), with no junk for questions the vault can't answer (scoring: 15
+ * junk hits on 8 questions). Clef-flash was worse (32 of 34).
+ */
+export const CLEF_MODEL = "@cf/cloudflare/clef";
+/** Recall candidates Clef judges: the closest memories by meaning (no cutoff) plus keyword hits, at most CLEF_MAX. */
+export const CLEF_SEMANTIC_CANDIDATES = 30;
+/** Clef takes at most 64 questions per request. */
+export const CLEF_MAX = 60;
+/** A memory is returned when Clef gives it at least this probability of helping; on the live vault no unrelated memory scored above 0.18. */
+export const CLEF_MIN_RELEVANCE = 0.3;
+/** Similar import items are flagged as possible conflicts when Clef gives a contradiction at least this probability (contradictions scored 0.97-0.98, others at most 0.03). */
+export const CLEF_MIN_CONFLICT = 0.5;
+/** Recall waits this long for Clef, then falls back to embedding-and-keyword scoring. */
+export const CLEF_TIMEOUT_MS = 8_000;
+
+export function relevanceQuestion(key: string): string {
+  return `Does memory ${key} help answer the question?`;
+}
+
+export function conflictQuestion(key: string): string {
+  return `Do memory_a and memory_b in pair ${key} contradict each other about any date, number, name, amount or choice?`;
+}
