@@ -126,10 +126,12 @@ export class MemoryVault extends DurableObject<Env> {
     }
     this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_mem_area ON memories(area, status)`);
     // v7: a memory's area name and aliases are searchable by keyword too, in a second, lower-weighted FTS column.
+    // v9: words are stemmed (porter), so "live" also finds "lives".
     if (!cols.includes("area_terms")) this.sql.exec(`ALTER TABLE memories ADD COLUMN area_terms TEXT`);
-    if (!this.sql.exec(`PRAGMA table_info(memories_fts)`).toArray().some((r) => r.name === "area_terms")) {
+    const ftsSql = String(this.sql.exec(`SELECT sql FROM sqlite_master WHERE name = 'memories_fts'`).one().sql);
+    if (!ftsSql.includes("area_terms") || !ftsSql.includes("porter")) {
       this.sql.exec(`DROP TRIGGER IF EXISTS memories_ai; DROP TRIGGER IF EXISTS memories_ad; DROP TRIGGER IF EXISTS memories_au; DROP TABLE memories_fts;
-        CREATE VIRTUAL TABLE memories_fts USING fts5(content, area_terms, content='memories', content_rowid='rowid');
+        CREATE VIRTUAL TABLE memories_fts USING fts5(content, area_terms, content='memories', content_rowid='rowid', tokenize='porter unicode61');
         CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
           INSERT INTO memories_fts(rowid, content, area_terms) VALUES (new.rowid, new.content, new.area_terms);
         END;

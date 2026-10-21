@@ -830,6 +830,26 @@ describe("v4 migration on an existing vault", () => {
   });
 });
 
+describe("v9 migration: stemmed keyword search", () => {
+  it("rebuilds an unstemmed index so other word forms match", async () => {
+    const old = createVault({ approvalMode: "auto" });
+    const m = await old.vault.remember({ content: "Sam lives in Denver with Robin" });
+    // Turn the keyword index back into its pre-v9 shape (no stemming).
+    old.db.exec(`DROP TRIGGER memories_ai; DROP TRIGGER memories_ad; DROP TRIGGER memories_au; DROP TABLE memories_fts;
+      CREATE VIRTUAL TABLE memories_fts USING fts5(content, area_terms, content='memories', content_rowid='rowid');
+      INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');`);
+    old.state.aiDown = true;
+    expect((await old.vault.recall({ query: "live" })).results).toEqual([]);
+
+    const h = createVault({ db: old.db });
+    h.state.aiDown = true;
+    expect(await h.vault.recall({ query: "live" })).toMatchObject({ mode: "keyword-only", results: [{ id: m.id }] });
+    // New writes are indexed stemmed too.
+    const n = await h.vault.remember({ content: "Sam's parents visited in June" });
+    expect((await h.vault.recall({ query: "parent visit" })).results.map((r) => r.id)).toEqual([n.id]);
+  });
+});
+
 describe("full backup and restore (review #5)", () => {
   /** A vault with history in it: replacements, an import that replaced something, a forget, a rejection, guide versions. */
   async function richVault() {
