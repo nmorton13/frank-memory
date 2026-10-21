@@ -128,15 +128,23 @@ export const TYPE_ORDER = ["fact", "preference", "decision", "project", "note"];
 
 // ---------- areas ----------
 /**
- * Agent recall returns the question's whole area while it fits this many tokens of slim records (about 4 chars
- * each), because reading everything beat search on a small vault.
+ * Agent recall returns the question's whole area while it has at most AREA_ALL_MAX_MEMORIES and fits
+ * AREA_ALL_BUDGET_TOKENS of slim records (about 4 chars each). Over that, it returns the area's preferences
+ * and relies on hybrid search for the rest.
  */
-export const AREA_ALL_BUDGET_TOKENS = 4_000;
+export const AREA_ALL_MAX_MEMORIES = 20;
+export const AREA_ALL_BUDGET_TOKENS = 1_500;
 /**
- * General memories (about the owner, how to work with them) matter for every question, so they get a larger budget.
- * Over it, recall returns the general preferences in full and finds other general memories by search.
+ * General memories (about the owner, how to work with them) matter for every question.
+ * Over this budget (or > AREA_ALL_MAX_MEMORIES), recall returns the general preferences in full and finds other general memories by search.
  */
-export const GENERAL_ALL_BUDGET_TOKENS = 6_000;
+export const GENERAL_ALL_BUDGET_TOKENS = 2_000;
+/**
+ * The general preferences (how to work with the owner) have their own, larger limits, because an agent needs them
+ * for every question and rarely searches for them. Over these, none load and search finds them.
+ */
+export const GENERAL_PREFS_MAX_MEMORIES = 40;
+export const GENERAL_PREFS_BUDGET_TOKENS = 4_000;
 /** An area is created once this many memories point to the same name. */
 export const AREA_MIN_MEMORIES = 3;
 
@@ -257,7 +265,11 @@ export function looksLikeSecret(s: string): boolean {
   return SECRET_PATTERNS.some((re) => re.test(s));
 }
 
-/** Limits on memory metadata. `source` leaves room for the " (via <client>)" suffix MCP adds. */
+/**
+ * Limits on memory content and metadata. Content stays within what the embedding model reads (512 tokens, about
+ * 2,000 chars), so all of it is searchable by meaning. `source` leaves room for the " (via <client>)" suffix MCP adds.
+ */
+export const MAX_CONTENT_LEN = 2000;
 export const MAX_SOURCE_LEN = 300;
 export const MAX_SOURCE_DATE_LEN = 40;
 export const MAX_GUIDE_LEN = 50_000;
@@ -509,9 +521,10 @@ export const AREA_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct";
  * areas alike (0.63-0.64), while the matches themselves name the area reliably.
  */
 export function dominantArea(hits: { area?: string | null }[]): string | null {
-  const top = hits.slice(0, 5);
-  const area = top[0]?.area;
-  return area && top.filter((h) => h.area === area).length >= 3 ? area : null;
+  const counts = new Map<string, number>();
+  for (const h of hits.slice(0, 5)) if (h.area) counts.set(h.area, (counts.get(h.area) ?? 0) + 1);
+  for (const [area, n] of counts) if (n >= 3) return area;
+  return null;
 }
 /** A new name the model suggests becomes an alias of an area whose description it is this similar to. */
 export const AREA_ALIAS_SIM = 0.85;

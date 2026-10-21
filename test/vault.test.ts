@@ -183,15 +183,20 @@ describe("areas", () => {
     expect(res.results.map((r) => r.id).slice(0, 2)).toEqual([inBeta.id, inAlpha.id]);
   });
 
-  it("searches instead of returning an area that is over budget", async () => {
+  it("searches instead of returning an area that is over budget (or > 20 memories), while keeping the area's preferences", async () => {
     const h = createVault();
     for (let i = 0; i < 6; i++)
-      await h.vault.remember({ content: `${"Garden journal entry about tomatoes and weather. ".repeat(65)}${i}`, source: "repo garden", ...ui });
+      await h.vault.remember({ content: `${"Garden journal entry about tomatoes and weather. ".repeat(35)}${i}`, source: "repo garden", ...ui });
     const match = await h.vault.remember({ content: "the garden zebra statue is by the shed", source: "repo garden", ...ui });
     const res = await h.vault.recall({ query: "garden zebra", complete: true });
     expect(res).toMatchObject({ area: "garden", complete: ["general"] });
     expect(res.results[0].id).toBe(match.id);
     expect(res.results.length).toBeLessThanOrEqual(8);
+
+    const pref = await h.vault.remember({ content: "Sam prefers heirloom seeds in the garden", type: "preference", area: "garden", ...ui });
+    const withPref = await h.vault.recall({ query: "garden zebra", complete: true });
+    expect(withPref).toMatchObject({ area: "garden", complete: ["garden preferences", "general"] });
+    expect(withPref.results.map((r) => r.id)).toContain(pref.id);
   });
 
   it("returns the general preferences in full when all general memories don't fit", async () => {
@@ -199,7 +204,18 @@ describe("areas", () => {
     const prefs = [];
     for (let i = 0; i < 3; i++) prefs.push((await h.vault.remember({ content: `Sam prefers option ${i}`, type: "preference", ...ui })).id);
     for (let i = 0; i < 8; i++)
-      await h.vault.remember({ content: `${"Sam's long travel journal about trains and coffee. ".repeat(60)}${i}`, type: "note", ...ui });
+      await h.vault.remember({ content: `${"Sam's long travel journal about trains and coffee. ".repeat(35)}${i}`, type: "note", ...ui });
+    const res = await h.vault.recall({ query: "what does Sam prefer", complete: true });
+    expect(res).toMatchObject({ complete: ["general preferences"] });
+    expect(res.results.map((r) => r.id)).toEqual(expect.arrayContaining(prefs));
+  });
+
+  it("gives the general preferences larger limits than a whole area", async () => {
+    const h = createVault();
+    const prefs = [];
+    // 25 preferences of ~300 chars: over the 20-memory and 2,000-token limits, within the preference limits.
+    for (let i = 0; i < 25; i++)
+      prefs.push((await h.vault.remember({ content: `Sam prefers rule ${i}: ${"keep replies short and plain. ".repeat(10)}`, type: "preference", ...ui })).id);
     const res = await h.vault.recall({ query: "what does Sam prefer", complete: true });
     expect(res).toMatchObject({ complete: ["general preferences"] });
     expect(res.results.map((r) => r.id)).toEqual(expect.arrayContaining(prefs));
@@ -368,12 +384,34 @@ describe("background area labeling", () => {
     expect(again.areaJobs().map((j) => j.memory_id)).toContain(m.id);
   });
 
-  it("infers the question's area from its best matches", async () => {
+  it("infers the question's area from its best matches and boosts in-area hits even when #1 was general", async () => {
     const h = await withAlpha();
-    for (const c of ["zebra banner", "zebra footer", "zebra favicon"]) await h.vault.remember({ content: `the ${c} is teal`, source: "repo alpha-site", ...ui });
+    const generalHit = await h.vault.remember({ content: "zebra zebra stripes are Sam's favourite pattern", ...ui });
+    const inArea: string[] = [];
+    for (const c of ["zebra banner", "zebra footer", "zebra favicon"])
+      inArea.push((await h.vault.remember({ content: `the ${c} is teal and has stripes`, source: "repo alpha-site", ...ui })).id as string);
     await h.vault.remember({ content: "the zebra cable behind the desk is grey and quite long", ...ui });
-    expect(await h.vault.recall({ query: "zebra", complete: true })).toMatchObject({ area: "alpha-site", complete: ["alpha-site", "general"] });
+    const res = await h.vault.recall({ query: "zebra", complete: true });
+    expect(res).toMatchObject({ area: "alpha-site", complete: ["alpha-site", "general"] });
+    // Once alpha-site is inferred from the top 5, its matches receive AREA_BONUS and rank ahead of the general hit.
+    expect(inArea).toContain(res.results[0].id);
+    expect(res.results.map((r) => r.id)).toContain(generalHit.id);
     expect(await h.vault.recall({ query: "grey cable", complete: true })).toMatchObject({ complete: ["general"] });
+  });
+
+  it("labels non-preferences before preferences so a new area exists when its preferences are checked", async () => {
+    const h = createVault();
+    h.state.chat = (p) => (p.startsWith("These memories") ? "Bread and coffee" : '["cooking"]');
+    h.state.confirm = () => "Yes.";
+    // The preference is saved first, before "cooking" exists.
+    const pref = await h.vault.remember({ content: "Sam prefers 78% hydration for country loaves", type: "preference", ...ui });
+    for (let i = 0; i < 10; i++)
+      await h.vault.remember({ content: `Sourdough bake note ${i}`, type: "fact", ...ui });
+    // First alarm processes the 10 facts (creating "cooking"); second alarm processes the preference into "cooking".
+    await h.vault.alarm();
+    h.makeAreaJobsDue();
+    await h.vault.alarm();
+    expect(areaOf(h, pref.id as string)).toBe("cooking");
   });
 });
 
@@ -630,10 +668,16 @@ describe("secret and length checks on every stored field (review #14)", () => {
     expect(h.rows()).toEqual([]);
   });
 
-  it("rejects over-long source and source_date", async () => {
+  it("rejects over-long content, source, and source_date", async () => {
     const h = createVault();
+    expect((await h.vault.remember({ content: "c".repeat(2001) })).ok).toBe(false);
     expect((await h.vault.remember({ content: "x is y", source: "s".repeat(301) })).ok).toBe(false);
     expect((await h.vault.remember({ content: "x is y", source_date: "d".repeat(41) })).ok).toBe(false);
+    const saved = await h.vault.remember({ content: "Sam uses Linear" });
+    expect((await h.vault.updateMemory(saved.id as string, { content: "c".repeat(2001) })).ok).toBe(false);
+    // An older memory over the limit can still change type.
+    h.db.prepare(`UPDATE memories SET content = ? WHERE id = ?`).run("Sam's old note. ".repeat(200), saved.id);
+    expect(await h.vault.updateMemory(saved.id as string, { type: "decision" })).toMatchObject({ ok: true });
   });
 
   it("skips import items with secret or over-long metadata, and rejects a secret batch source", async () => {

@@ -110,6 +110,7 @@
 const TYPES = ["fact","preference","decision","note","project"];
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const escJs = (s) => encodeURIComponent(String(s == null ? "" : s)).replace(/'/g, "%27");
 const fmt = (s) => s ? new Date(s).toLocaleString() : "";
 function toast(t) { const e = $("toast"); e.textContent = t; e.style.display = "block"; setTimeout(() => e.style.display = "none", 2500); }
 async function call(path, method, body) {
@@ -173,7 +174,7 @@ async function loadApps() {
   const a = await call("/oauth/grants");
   $("apps").innerHTML = a.length ? a.map((g) => '<div class="row mem"><span style="flex:1"><b>' + esc(g.client_name) + '</b> <span class="meta">· ' + esc(g.redirect_uri ? new URL(g.redirect_uri).host || g.redirect_uri : "") +
     ' · connected ' + fmt(g.created_at) + (g.scope && g.scope.length ? ' · ' + esc(g.scope.join(" ")) : '') + ' · ' + esc(g.client_id) + '</span></span>' +
-    '<button class="d" onclick="revokeApp(\'' + esc(g.grant_id) + '\')">Revoke</button></div>').join("") : "No connected apps.";
+    '<button class="d" onclick="revokeApp(decodeURIComponent(\'' + escJs(g.grant_id) + '\'))">Revoke</button></div>').join("") : "No connected apps.";
 }
 async function revokeApp(id) { if (confirm("Revoke this app's access? It will need to sign in again.")) { await call("/oauth/grants/" + encodeURIComponent(id) , "DELETE"); toast("Revoked"); loadApps(); } }
 async function loadGuide() { const g = await call("/guide"); $("guide").value = g.content; $("gver").textContent = "v" + g.version; $("gmeta").textContent = "updated " + fmt(g.updated_at) + " · " + g.history.length + " versions" + (g.newer_default ? " · a newer default guide is available: click Load latest default to review it" : ""); }
@@ -192,7 +193,7 @@ async function loadAreas() {
     : "No areas yet. They appear once a few memories share a project.";
   $("removed").innerHTML = r.removed.length ? "Removed (won't be created again): " + r.removed.map((n) => esc(n) + ' <button onclick="unblockArea(\'' + n + '\')">Allow again</button>').join(" ") : "";
   $("runs").innerHTML = r.runs.length ? r.runs.map((x) => '<div class="row mem"><span style="flex:1">' + esc(runLabel(x.run)) + ' · ' + x.changes + ' change' + (x.changes === 1 ? '' : 's') + ' · ' + fmt(x.finished) + (x.undone ? ' · undone' : '') + '</span>' +
-    (x.undone < x.changes ? '<button class="d" onclick="undoRun(\'' + encodeURIComponent(x.run) + '\')">Undo</button>' : '') + '</div>').join("") : "Nothing yet.";
+    (x.undone < x.changes ? '<button class="d" onclick="undoRun(\'' + escJs(x.run) + '\')">Undo</button>' : '') + '</div>').join("") : "Nothing yet.";
 }
 function runLabel(run) {
   if (run === "backfill") return "First labeling of existing memories";

@@ -4,10 +4,10 @@ import { defaultGuide } from "./guide";
 import {
   Backup, BACKUP_FORMAT, BACKUP_VERSION, base64ToBuffer, bufferToBase64, parseBackup,
   AI_TIMEOUT_MS, bestMatch, chunk, classifySimilarity, cosine, coerceItems, contentHash, sha256Hex, ImportItem, isMemoryStatus, isMemoryType,
-  keywordStrengths, looksLikeSecret, MAX_GUIDE_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MemoryStatus, metadataProblem, MemoryType, MIN_SEMANTIC_SIM, parseRetentionDays, Retention, RETENTION_DEFAULTS, RETENTION_KEYS,
+  keywordStrengths, looksLikeSecret, MAX_CONTENT_LEN, MAX_GUIDE_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MemoryStatus, metadataProblem, MemoryType, MIN_SEMANTIC_SIM, parseRetentionDays, Retention, RETENTION_DEFAULTS, RETENTION_KEYS,
   retentionCutoff, sanitizeFtsQuery, scoreRecallHit, slimMemory, splitImportText, TYPE_ORDER,
-  AREA_ALIAS_SIM, AREA_ALL_BUDGET_TOKENS, AREA_MIN_MEMORIES, AREA_MODEL, AreaDef, areaDescriptionPrompt, areaLabelPrompt, areasNamedIn,
-  aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
+  AREA_ALIAS_SIM, AREA_ALL_BUDGET_TOKENS, AREA_ALL_MAX_MEMORIES, AREA_BONUS, AREA_MIN_MEMORIES, AREA_MODEL, AreaDef, areaDescriptionPrompt, areaLabelPrompt, areasNamedIn,
+  aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
 } from "./helpers";
 
 export const EMBED_MODEL = "@cf/baai/bge-base-en-v1.5";
@@ -59,9 +59,11 @@ export class MemoryVault extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.migrate();
-    // Daily history cleanup and index retries run on a Durable Object alarm; make sure one is scheduled.
-    ctx.blockConcurrencyWhile(() => this.scheduleAlarm());
+    // Daily history cleanup and index retries run on a Durable Object alarm; make sure schema and alarm are ready.
+    ctx.blockConcurrencyWhile(async () => {
+      this.migrate();
+      await this.scheduleAlarm();
+    });
   }
 
   private migrate() {
@@ -241,7 +243,9 @@ export class MemoryVault extends DurableObject<Env> {
       this.audit("area_created", null, "system", { name: r.name, run });
     }
     const areas = this.areaDefs();
-    for (const r of this.sql.exec(`SELECT id FROM memories WHERE area IS NULL`).toArray())
+    for (const r of this.sql.exec(
+      `SELECT id FROM memories WHERE area IS NULL AND (area_source IS NULL OR area_hint IS NOT NULL OR supersedes IS NOT NULL OR instr(lower(coalesce(source, '')), 'repo') > 0)`,
+    ).toArray())
       this.labelArea(r.id as string, { areas, run });
   }
 
@@ -260,8 +264,11 @@ export class MemoryVault extends DurableObject<Env> {
    */
   private async labelAreasInBackground() {
     await this.describeAreas();
-    const jobs = this.sql.exec(`SELECT memory_id, content_hash, attempts FROM area_jobs WHERE next_at <= ? ORDER BY next_at LIMIT ?`,
-      now(), AREA_JOB_BATCH).toArray();
+    const jobs = this.sql.exec(
+      `SELECT j.memory_id, j.content_hash, j.attempts FROM area_jobs j LEFT JOIN memories m ON m.id = j.memory_id
+       WHERE j.next_at <= ? ORDER BY (m.type = 'preference'), j.next_at LIMIT ?`,
+      now(), AREA_JOB_BATCH,
+    ).toArray();
     if (!jobs.length) return;
     const areas = this.areaDefs();
     const vecs = this.areaVectors();
@@ -281,13 +288,15 @@ export class MemoryVault extends DurableObject<Env> {
         const suggested = names.length === 1 ? normalizeArea(names[0]) : null;
         const name = suggested && !blocked.includes(suggested) ? suggested : null;
         if (name) {
-          const known = resolveArea(name, areas) ?? (await this.learnAlias(name, areas, vecs));
+          const direct = resolveArea(name, areas);
+          const learned = direct ? null : await this.learnAlias(name, areas, vecs);
+          const known = direct ?? learned?.area ?? null;
+          if (learned?.added) changed = true;
           // An existing area only after a second yes/no check. A new name only counts toward creating that area,
           // and never for a preference.
           if (known) {
             if (await this.confirmArea(m as { content: string; type: string }, known)) pick = { area: known, hint: null, source: "model" };
           } else if (m.type !== "preference") pick = { area: null, hint: name, source: "model" };
-          if (known) changed = true;
         }
         // Only if the memory didn't change while the model was answering.
         this.writeArea(id, pick.area, pick.source, pick.hint, hash);
@@ -331,7 +340,7 @@ export class MemoryVault extends DurableObject<Env> {
   }
 
   /** A name the model suggests that is really an existing area: record it as an alias and return the area. */
-  private async learnAlias(name: string, areas: AreaDef[], vecs: { name: string; vec: Float32Array }[]): Promise<string | null> {
+  private async learnAlias(name: string, areas: AreaDef[], vecs: { name: string; vec: Float32Array }[]): Promise<{ area: string; added: boolean } | null> {
     let area = aliasOf(name, areas);
     if (!area && vecs.length) {
       const v = await this.embed([name.replace(/-/g, " ")]);
@@ -339,13 +348,14 @@ export class MemoryVault extends DurableObject<Env> {
     }
     if (!area) return null;
     const def = areas.find((a) => a.name === area)!;
-    if (!def.aliases.includes(name)) {
+    const added = !def.aliases.includes(name);
+    if (added) {
       def.aliases.push(name);
       this.sql.exec(`UPDATE areas SET aliases = ? WHERE name = ?`, JSON.stringify(def.aliases), area);
       this.refreshAreaTerms(area);
       this.audit("area_alias", null, "system", { area, alias: name });
     }
-    return area;
+    return { area, added };
   }
 
   /** Write a one-line description for areas that lack one (AREA_MODEL) and embed it, for matching by embedding. */
@@ -651,7 +661,7 @@ export class MemoryVault extends DurableObject<Env> {
     const actor = input.actor ?? "agent";
     const content = (input.content ?? "").trim();
     if (!content) return { ok: false, error: "content is empty" };
-    if (content.length > 4000) return { ok: false, error: "content too long (max 4000 chars); split into separate memories" };
+    if (content.length > MAX_CONTENT_LEN) return { ok: false, error: `content too long (max ${MAX_CONTENT_LEN} chars); split into separate memories` };
     if (looksLikeSecret(content)) {
       this.audit("reject_secret", null, actor, { reason: "looks like a secret; content not stored" });
       return { ok: false, status: "rejected", error: "Content looks like a secret/credential and was NOT stored." };
@@ -766,7 +776,7 @@ export class MemoryVault extends DurableObject<Env> {
     const candidates: (ImportItem & { content: string; hash: string })[] = [];
     for (const it of items) {
       const content = it.content.trim();
-      if (!content || content.length > 4000) { invalid++; continue; }
+      if (!content || content.length > MAX_CONTENT_LEN) { invalid++; continue; }
       if (looksLikeSecret(content)) { secrets++; continue; }
       const meta = metadataProblem(it);
       if (meta) { if (meta.kind === "secret") secrets++; else invalid++; continue; }
@@ -882,10 +892,10 @@ export class MemoryVault extends DurableObject<Env> {
     const areas = this.areaDefs();
     const asked = normalizeArea(input.area);
     const named = areasNamedIn(input.query ?? "", areas);
-    let area = asked ? resolveArea(asked, areas) : named.length === 1 ? named[0] : null;
-    const found = await this.search({ ...input, area });
-    if (!asked && !named.length) area = dominantArea(found.results);
-    if (!input.complete) return { ...found, ...(area ? { area } : {}) };
+    const explicitArea = asked ? resolveArea(asked, areas) : named.length === 1 ? named[0] : null;
+    const found = await this.search({ ...input, area: explicitArea });
+    const area = found.area;
+    if (!input.complete) return { mode: found.mode, results: found.results, ...(area ? { area } : {}) };
     const results: (Memory | RecallHit)[] = [...found.results];
     const seen = new Set(results.map((h) => h.id));
     const complete: string[] = [];
@@ -894,26 +904,34 @@ export class MemoryVault extends DurableObject<Env> {
       complete.push(label);
       for (const m of rows) if (!seen.has(m.id)) { seen.add(m.id); results.push(m); }
     };
-    if (area) add(area, this.wholeArea(input, area, AREA_ALL_BUDGET_TOKENS));
+    if (area) {
+      const whole = this.wholeArea(input, area, AREA_ALL_BUDGET_TOKENS);
+      if (whole || input.type) add(area, whole);
+      else {
+        const prefs = this.wholeArea({ ...input, type: "preference" }, area, AREA_ALL_BUDGET_TOKENS);
+        if (prefs?.length) add(`${area} preferences`, prefs);
+      }
+    }
     const general = this.wholeArea(input, null, GENERAL_ALL_BUDGET_TOKENS);
     if (general || input.type) add("general", general);
-    else add("general preferences", this.wholeArea({ ...input, type: "preference" }, null, GENERAL_ALL_BUDGET_TOKENS));
+    else add("general preferences", this.wholeArea({ ...input, type: "preference" }, null, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES));
     return { mode: found.mode, ...(area ? { area } : {}), complete, results };
   }
 
   /**
    * Every memory recall may return from one area (null = general), grouped by type and newest first,
-   * or null if they don't fit in `budgetTokens`.
+   * or null if there are more than `maxRows` or they don't fit in `budgetTokens`.
    */
-  private wholeArea(input: { type?: string; status?: string }, area: string | null, budgetTokens: number): Memory[] | null {
+  private wholeArea(input: { type?: string; status?: string }, area: string | null, budgetTokens: number, maxRows = AREA_ALL_MAX_MEMORIES): Memory[] | null {
     const where = [input.status ? "status = ?" : "status IN ('active','proposed')", area ? "area = ?" : "area IS NULL"];
     const args: unknown[] = input.status ? [input.status] : [];
     if (area) args.push(area);
     if (input.type) { where.push("type = ?"); args.push(input.type); }
     const w = where.join(" AND ");
     const budget = budgetTokens * 4;
-    // Content alone is a lower bound on the result size, so a large area never loads every row.
-    if (Number(this.sql.exec(`SELECT COALESCE(SUM(LENGTH(content)), 0) AS n FROM memories WHERE ${w}`, ...args).one().n) > budget) return null;
+    // Count and content length are checked in SQL first, so a large area never loads every row.
+    const stat = this.sql.exec(`SELECT COUNT(*) AS c, COALESCE(SUM(LENGTH(content)), 0) AS n FROM memories WHERE ${w}`, ...args).one();
+    if (Number(stat.c) > maxRows || Number(stat.n) > budget) return null;
     const rows = this.sql.exec(`SELECT ${COLS} FROM memories WHERE ${w} ORDER BY updated_at DESC`, ...args).toArray() as unknown as Memory[];
     if (rows.reduce((n, m) => n + JSON.stringify(slimMemory(m)).length, 0) > budget) return null;
     const rank = (t: string) => (TYPE_ORDER.includes(t) ? TYPE_ORDER.indexOf(t) : TYPE_ORDER.length);
@@ -975,7 +993,7 @@ export class MemoryVault extends DurableObject<Env> {
     }
     const keyword = keywordStrengths(keywordRows);
     const semanticSet = new Set(semantic);
-    const hits: RecallHit[] = [];
+    const candidates: { m: Memory; matched: RecallHit["matched"]; similarity?: number; baseScore: number }[] = [];
     for (const id of new Set([...semantic, ...keyword.keys()])) {
       if (!eligible(id)) continue;
       const m = rows.get(id)!;
@@ -983,14 +1001,20 @@ export class MemoryVault extends DurableObject<Env> {
       if (semanticSet.has(id)) matched.push("semantic");
       if (keyword.has(id)) matched.push("keyword");
       const similarity = sims.has(id) ? Number(sims.get(id)!.toFixed(4)) : undefined;
-      const score = scoreRecallHit({
+      const baseScore = scoreRecallHit({
         similarity: semanticSet.has(id) ? sims.get(id) : undefined, keyword: keyword.get(id),
-        status: m.status, updatedAtMs: Date.parse(m.updated_at), inArea: !!input.area && m.area === input.area,
+        status: m.status, updatedAtMs: Date.parse(m.updated_at), inArea: false,
       });
-      hits.push({ ...m, matched, similarity, score: Number(score.toFixed(6)) });
+      candidates.push({ m, matched, similarity, baseScore });
     }
+    candidates.sort((a, b) => b.baseScore - a.baseScore);
+    const area = input.area ?? dominantArea(candidates.slice(0, limit).map((c) => c.m));
+    const hits: RecallHit[] = candidates.map(({ m, matched, similarity, baseScore }) => {
+      const score = area && m.area === area ? baseScore + AREA_BONUS : baseScore;
+      return { ...m, matched, similarity, score: Number(score.toFixed(6)) };
+    });
     hits.sort((a, b) => b.score - a.score);
-    return { mode: semanticOk ? "hybrid" : "keyword-only", results: hits.slice(0, limit) };
+    return { mode: semanticOk ? "hybrid" : "keyword-only", area, results: hits.slice(0, limit) };
   }
 
   async listMemories(filters: ListFilters = {}, limit = 50, offset = 0) {
@@ -1056,6 +1080,8 @@ export class MemoryVault extends DurableObject<Env> {
     if (!m) return { ok: false, error: "not found" };
     const content = (patch.content ?? m.content).trim();
     if (!content) return { ok: false, error: "content is empty" };
+    // Only new text is held to the length limit, so an older long memory can still change type.
+    if (content !== m.content.trim() && content.length > MAX_CONTENT_LEN) return { ok: false, error: `content too long (max ${MAX_CONTENT_LEN} chars); split into separate memories` };
     if (looksLikeSecret(content)) return { ok: false, error: "Content looks like a secret; not saved." };
     const hash = await contentHash(content);
     if (hash !== m.content_hash) {
@@ -1293,6 +1319,8 @@ export class MemoryVault extends DurableObject<Env> {
       return { ok: false, not_empty: true, error: "This vault already has memories. Restoring replaces everything in it; download a backup of it first, then restore with replace." };
 
     const previous = this.sql.exec(`SELECT id FROM memories`).toArray().map((r) => r.id as string);
+    const reembed = memories.filter((m) => !m.embedding && m.status !== "rejected").length;
+    const restored = { memories: memories.length, exclusions: b.exclusions.length, batches: b.batches.length, audit: b.audit.length, guide_version: b.guide.version };
     try {
       this.ctx.storage.transactionSync(() => {
         for (const table of ["memories", "exclusions", "batches", "guide_history", "audit", "index_jobs", "area_jobs", "areas"]) this.sql.exec(`DELETE FROM ${table}`);
@@ -1322,18 +1350,15 @@ export class MemoryVault extends DurableObject<Env> {
           this.sql.exec(`INSERT INTO audit(action, memory_id, actor, details, timestamp) VALUES (?, ?, ?, ?, ?)`, a.action, a.memory_id ?? null, a.actor ?? null, a.details ?? null, a.timestamp);
         // Vectors of the replaced memories are removed and the restored ones indexed (rejected ones get no vector).
         this.queueIndex([...previous, ...memories.map((m) => m.id)]);
+        this.audit("restore", null, actor, { from: b.exported_at, replaced: previous.length, ...restored, reembed });
+        // Restored labels are kept (owner, agent and model choices stick); a backup from before areas is labeled afresh.
+        for (const a of this.areaDefs()) this.refreshAreaTerms(a.name);
+        this.relabelAreas("restore");
       });
     } catch (e) {
       // The transaction rolled back, so the vault is exactly as it was.
       return { ok: false, error: `restore failed and nothing was changed: ${(e as Error).message}` };
     }
-    const reembed = memories.filter((m) => !m.embedding && m.status !== "rejected").length;
-    const restored = { memories: memories.length, exclusions: b.exclusions.length, batches: b.batches.length, audit: b.audit.length, guide_version: b.guide.version };
-    this.audit("restore", null, actor, { from: b.exported_at, replaced: previous.length, ...restored, reembed });
-    // Restored labels are kept (owner, agent and model choices stick); a backup from before areas is labeled afresh.
-    for (const a of this.areaDefs()) this.refreshAreaTerms(a.name);
-    this.relabelAreas("restore");
-    await this.scheduleAlarm();
     await this.scheduleAlarm();
     return { ok: true, from: b.exported_at, replaced: previous.length, restored, reembed, note: "The search index is rebuilding in the background; keyword search works meanwhile." };
   }
