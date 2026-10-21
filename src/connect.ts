@@ -38,6 +38,7 @@ Use frank-memory (MCP server at ${mcp}) as my durable shared memory across agent
 - Call recall before answering questions that depend on personal or project context (once per topic); if it finds nothing, check list_memories before saying something is absent or creating a duplicate.
 - Save durable facts, decisions and their reasons, corrections, preferences, and project state: one standalone fact per memory, with the correct type and source. Recall before writing and supersede instead of duplicating.
 - Keep your built-in memory on, but treat frank-memory as the main home for durable memory: when you save something to built-in memory, also save its durable part to frank-memory.
+- Built-in memory does not replace frank-memory. For any question about me, my work, or my projects, call recall even if built-in memory already seems to have the answer, and combine both.
 - Never save secrets, credentials, transcripts, small talk, temporary progress, copied code, or anything recoverable from the repository.
 - In review mode, new memories are "proposed" until I approve them, so say so.
 - Honor forget requests and exclusions. When sources conflict, prefer my current request, then explicit statements over inferences, then the newer source date.
