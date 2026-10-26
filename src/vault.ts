@@ -7,6 +7,7 @@ import {
   keywordStrengths, looksLikeSecret, MAX_CONTENT_LEN, MAX_GUIDE_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MemoryStatus, metadataProblem, MemoryType, MIN_SEMANTIC_SIM, parseRetentionDays, Retention, RETENTION_DEFAULTS, RETENTION_KEYS,
   retentionCutoff, sanitizeFtsQuery, scoreRecallHit, slimMemory, splitImportText, TYPE_ORDER,
   AREA_ALIAS_SIM, AREA_ALL_BUDGET_TOKENS, AREA_ALL_MAX_MEMORIES, AREA_BONUS, AREA_MIN_MEMORIES, AREA_MODEL, AreaDef, areaDescriptionPrompt, areaLabelPrompt, areasNamedIn,
+  fillOwner, namesNoOne, parseQuality, QUALITY_MODEL, QUALITY_TIMEOUT_MS, qualityPrompt,
   CLEF_MAX, CLEF_MIN_CONFLICT, CLEF_MIN_RELEVANCE, CLEF_MODEL, CLEF_SEMANTIC_CANDIDATES, CLEF_TIMEOUT_MS, conflictQuestion, relevanceQuestion,
   aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, cleanMerged, isNothingMissing, isYes, lostDetails, MERGE_MIN_SIM, MERGE_MODEL, mergeCheckPrompt, mergePrompt, sameFactPrompt, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
 } from "./helpers";
@@ -838,7 +839,7 @@ export class MemoryVault extends DurableObject<Env> {
   // ---------- writes ----------
   async remember(input: {
     content: string; type?: string; source?: string; status?: string; supersedes?: string;
-    source_date?: string; area?: string; actor?: string;
+    source_date?: string; area?: string; actor?: string; owner_requested?: boolean;
   }) {
     const actor = input.actor ?? "agent";
     const content = (input.content ?? "").trim();
@@ -900,6 +901,18 @@ export class MemoryVault extends DurableObject<Env> {
       }
     }
 
+    // Agents' new wording is checked first; the owner's own writes, and memories the owner asked for, are not.
+    if (!dup && actor !== "ui" && !input.owner_requested) {
+      const reason = await this.qualityProblem(content, type);
+      if (reason) {
+        this.audit("quality_reject", null, actor, { type });
+        return {
+          ok: false, status: "not_stored", reason,
+          error: fillOwner(`Not stored: ${reason.replace(/\.?$/, ".")} Save the lasting part instead, standalone and with calendar dates: a decision and its reason, a preference, a fact, or where the project stands. If {owner} explicitly asked you to save this as written, call again with owner_requested: true.`, this.env.OWNER_NAME),
+        };
+      }
+    }
+
     const id = newId(); const t = now();
     this.sql.exec(
       `INSERT INTO memories(id, content, type, status, supersedes, source, content_hash, batch_id, source_date, confirmed_at, created_at, updated_at)
@@ -915,6 +928,23 @@ export class MemoryVault extends DurableObject<Env> {
     const idx = await this.indexNow(supersedes ? [id, supersedes] : [id]);
     await this.scheduleAlarm();
     return { ok: true, id, status, type, supersedes, ...(area ? { area } : {}), ...(note ? { note } : {}), ...idx };
+  }
+
+  /**
+   * Why a memory an agent wants to save isn't worth keeping as written (a work log, temporary progress, or wording
+   * that needs this chat to make sense), or null to store it. When QUALITY_MODEL is unavailable or its answer is
+   * unusable, the memory is stored as written: a missed check costs less than a lost memory.
+   */
+  private async qualityProblem(content: string, type: string): Promise<string | null> {
+    if (namesNoOne(content)) return "It opens with a pronoun and names no one, so later readers can't tell who or what it is about.";
+    try {
+      const r = await withTimeout(this.env.AI.run(QUALITY_MODEL as any, {
+        messages: [{ role: "user", content: qualityPrompt({ content, type }, this.env.OWNER_NAME?.trim() || "the vault owner") }],
+        max_tokens: 120, temperature: 0,
+      }), QUALITY_TIMEOUT_MS, "quality check");
+      const v = parseQuality(chatText(r));
+      return v?.verdict === "reject" ? v.reason : null;
+    } catch { return null; }
   }
 
   /** The active memory that (directly or through a chain of replacements) replaced this one, if any. */

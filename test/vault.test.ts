@@ -1264,3 +1264,54 @@ describe("newer default guide notice", () => {
     expect(await h.vault.newerDefaultGuide()).toBe(true);
   });
 });
+
+describe("write-time quality check", () => {
+  const reject = "VERDICT: reject\nREASON: It is mainly a log of work just done";
+
+  it("turns away what the check rejects, with the reason, and stores nothing", async () => {
+    const h = createVault({ approvalMode: "auto" });
+    h.state.quality = () => reject;
+    const res = await h.vault.remember({ content: "Ran the tests: all 120 pass.", actor: "mcp:Claude" });
+    expect(res).toMatchObject({
+      ok: false, status: "not_stored", reason: "It is mainly a log of work just done",
+      error: expect.stringMatching(/^Not stored: It is mainly a log of work just done\. Save the lasting part.*If Sam explicitly asked/),
+    });
+    expect(h.rows()).toEqual([]);
+  });
+
+  it("stores what the check keeps", async () => {
+    const h = createVault({ approvalMode: "auto" });
+    const res = await h.vault.remember({ content: "Sam prefers short answers in chat.", actor: "mcp:Claude" });
+    expect(res).toMatchObject({ ok: true, status: "active" });
+    expect(h.state.qualityCalls).toBe(1);
+    expect(h.state.prompts).toEqual([]); // the check doesn't count as an area or merge prompt
+  });
+
+  it("skips the check for the owner, for memories the owner asked for, and for wording already stored", async () => {
+    const h = createVault({ approvalMode: "auto" });
+    h.state.quality = () => reject;
+    expect(await h.vault.remember({ content: "Deployed version 5e1f2a7c.", actor: "ui" })).toMatchObject({ ok: true });
+    expect(await h.vault.remember({ content: "Committed 4f2a91c.", actor: "mcp:Claude", owner_requested: true })).toMatchObject({ ok: true });
+    expect(await h.vault.remember({ content: "Deployed version 5e1f2a7c.", actor: "mcp:Claude" })).toMatchObject({ ok: true, duplicate: true });
+    expect(h.state.qualityCalls).toBe(0);
+  });
+
+  it("turns away a memory that opens with a pronoun and names no one, without asking the model", async () => {
+    const h = createVault({ approvalMode: "auto" });
+    const res = await h.vault.remember({ content: "He prefers dark mode in every editor.", actor: "mcp:Claude" });
+    expect(res).toMatchObject({ ok: false, status: "not_stored" });
+    expect(h.state.qualityCalls).toBe(0);
+    expect(await h.vault.remember({ content: "He is Sam's brother Theo.", actor: "mcp:Claude" })).toMatchObject({ ok: true });
+  });
+
+  it("stores the memory as written when the check is down or its answer is unusable", async () => {
+    const h = createVault({ approvalMode: "auto" });
+    h.state.qualityDown = true;
+    expect(await h.vault.remember({ content: "Sam's sister lives in Lisbon.", actor: "mcp:Claude" })).toMatchObject({ ok: true });
+    h.state.qualityDown = false;
+    h.state.quality = () => "I think this memory is fine.";
+    expect(await h.vault.remember({ content: "Sam takes the 7:40 train.", actor: "mcp:Claude" })).toMatchObject({ ok: true });
+    h.state.quality = () => "VERDICT: reject"; // no reason to pass on
+    expect(await h.vault.remember({ content: "Sam's cat is named Miso.", actor: "mcp:Claude" })).toMatchObject({ ok: true });
+  });
+});

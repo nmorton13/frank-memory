@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   bestMatch, classifySimilarity, contentHash, fillOwner, listIncludes, intParam, looksLikeSecret, meaningTokens, NEAR_DUP_SIM, parseRetentionDays, retentionCutoff,
   keywordStrengths, sanitizeFtsQuery, scoreRecallHit, SIMILAR_SIM, slimMemory, splitImportText, unitVector, withTimeout,
-  areasNamedIn, chatText, normalizeArea, parseAreaNames, pickArea, repoFromSource,
+  areasNamedIn, chatText, namesNoOne, normalizeArea, parseAreaNames, parseQuality, pickArea, qualityPrompt, repoFromSource,
 } from "../src/helpers";
 
 describe("splitImportText", () => {
@@ -332,5 +332,27 @@ describe("merge guards", () => {
     expect(isNothingMissing("Everything is there.\nNOTHING MISSING")).toBe(true);
     expect(isNothingMissing("- the date\nSOMETHING MISSING")).toBe(false);
     expect(isNothingMissing("Comparing the two")).toBe(false);
+  });
+});
+
+describe("quality check", () => {
+  it("reads the verdict and reason, and treats anything else as no verdict", () => {
+    expect(parseQuality("VERDICT: keep\nREASON: A preference.")).toEqual({ verdict: "keep" });
+    expect(parseQuality("**VERDICT:** Reject\n**REASON:** A to-do.")).toEqual({ verdict: "reject", reason: "A to-do." });
+    expect(parseQuality("VERDICT: reject")).toBeNull();
+    expect(parseQuality("VERDICT: rewrite\nREASON: x")).toBeNull();
+    expect(parseQuality("")).toBeNull();
+  });
+  it("names the owner and the memory's type in the prompt", () => {
+    const p = qualityPrompt({ content: "Sam uses Vim.", type: "fact" }, "Sam");
+    expect(p).toContain("Sam's long-term memory vault");
+    expect(p).toContain("Memory (type: fact):\n\"\"\"\nSam uses Vim.");
+  });
+  it("catches a memory that opens with a pronoun and names nothing", () => {
+    expect(namesNoOne("He prefers dark mode.")).toBe(true);
+    expect(namesNoOne("They decided to use the simpler option.")).toBe(true);
+    expect(namesNoOne("He is Sam's brother.")).toBe(false);
+    expect(namesNoOne("Help desk roles are out.")).toBe(false);
+    expect(namesNoOne("Sam prefers dark mode.")).toBe(false);
   });
 });

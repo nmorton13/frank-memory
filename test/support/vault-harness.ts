@@ -87,6 +87,9 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
     /** Clef: the probability for each question, given the request. Unset = Clef unavailable (recall falls back). */
     clef: null as null | ((state: any, questions: Record<string, { instructions: string }>) => Record<string, number>),
     clefCalls: 0,
+    /** Answers of the write-time quality check, by prompt. Keeps everything by default. */
+    quality: (_prompt: string): string => "VERDICT: keep\nREASON: Worth keeping.",
+    qualityDown: false, qualityCalls: 0,
     chatDown: false, chatCalls: 0, prompts: [] as string[],
   };
 
@@ -97,6 +100,11 @@ export function createVault(opts: { approvalMode?: "review" | "auto"; db?: Datab
         if (!state.clef) throw new Error("clef not mocked");
         const p = state.clef(input.state, input.questions);
         return { model: "clef", answers: Object.fromEntries(Object.entries(p).map(([k, v]) => [k, { type: "noul", noul: v }])) };
+      }
+      if (input.messages?.[0].content.startsWith("An AI assistant wants to save")) {
+        state.qualityCalls++;
+        if (state.qualityDown) throw new Error("AI unavailable");
+        return { response: state.quality(input.messages[0].content) };
       }
       if (input.messages && model === MERGE_MODEL) {
         state.chatCalls++;

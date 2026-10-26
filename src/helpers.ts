@@ -749,3 +749,52 @@ export function relevanceQuestion(key: string): string {
 export function conflictQuestion(key: string): string {
   return `Do memory_a and memory_b in pair ${key} contradict each other about any date, number, name, amount or choice?`;
 }
+
+// ---------- write-time quality check ----------
+/**
+ * Model that checks a memory an agent wants to save, and sends back a work log, temporary progress or wording that
+ * only makes sense inside the chat, with the reason. It never rewrites: on the live vault (2026-10-26) its rewrites
+ * made up dates ("Sunday" became "Sunday, 2026-10-11"), and the agent that wrote the memory knows the date and the
+ * subject, so it fixes the wording itself.
+ */
+export const QUALITY_MODEL = MERGE_MODEL;
+/** A write waits this long for the check, then stores the memory as written. */
+export const QUALITY_TIMEOUT_MS = 8_000;
+
+export function qualityPrompt(m: { content: string; type: string }, owner: string): string {
+  return `An AI assistant wants to save this memory to ${owner}'s long-term memory vault. Every assistant ${owner} uses will read it later, in other chats, weeks from now, with none of this chat's context.
+
+Memory (type: ${m.type}):
+"""
+${m.content}
+"""
+
+Answer "reject" if any of these is true:
+1. It is mainly a log of work just done: what was changed, committed, deployed, tested or fixed, with commit hashes, version ids, file names or test counts. The code repository and its history already record that.
+2. It is temporary progress or a to-do: "now running tests", "next step: deploy", "remember to email Y", "waiting for the build".
+3. It is small talk, or about this chat itself rather than about ${owner}, their life, people, systems or projects.
+4. A reader weeks from now couldn't tell what it is about: its subject is a pronoun ("He prefers…", "They decided…") or "the user", "this", "the project", "the app" with no name anywhere in it, or it uses a relative date such as "yesterday", "today", "last week" or "next Thursday" instead of a calendar date. (A recurring day such as "every Sunday" is fine.)
+
+Otherwise answer "keep". Keep these even when they mention commits, versions or dates: where a project stands (what is live, what is unfinished, what was chosen), a decision and its reason, a test result that explains a decision, a setup or configuration fact, a preference or a correction. Words like "maybe" or "considering" are fine: they record that ${owner} is unsure. When unsure, keep.
+
+Answer in exactly this form, with nothing before it:
+VERDICT: keep or reject
+REASON: one short sentence; for reject, say what to change so it is worth keeping`;
+}
+
+/**
+ * A memory that opens with a pronoun and names nothing ("He prefers dark mode in every editor."). The model keeps
+ * these, so they are caught before it is asked.
+ */
+export function namesNoOne(content: string): boolean {
+  const m = content.match(/^\s*(he|she|they|it|this|that|these|those|we)\b/i);
+  return !!m && !/\p{Lu}/u.test(content.slice(m.index! + m[0].length));
+}
+
+/** The check's verdict from its answer, or null when the answer is unusable (the memory is then stored as written). */
+export function parseQuality(answer: string): { verdict: "keep" } | { verdict: "reject"; reason: string } | null {
+  const verdict = answer.match(/^\W*VERDICT:\W*(keep|reject)\b/im)?.[1].toLowerCase();
+  const reason = (answer.match(/^\W*REASON:[*\s]*(.+)$/im)?.[1] ?? "").trim().slice(0, 300);
+  if (verdict === "keep") return { verdict: "keep" };
+  return verdict === "reject" && reason ? { verdict: "reject", reason } : null;
+}

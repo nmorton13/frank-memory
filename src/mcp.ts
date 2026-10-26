@@ -72,11 +72,17 @@ export function buildMcpServer(vault: Vault, caller: McpCaller = {}) {
     source_date: z.string().max(40).optional().describe("ISO date when this was stated or decided, if known (not today's date by default)"),
     supersedes: z.string().optional().describe("Id of the memory this replaces. Recall first, then supersede instead of duplicating."),
     area: z.string().max(60).optional().describe("Optional: the project or area this memory belongs to. Usually leave it out; the vault labels memories itself."),
+    owner_requested: z.boolean().optional().describe(t("True only when {owner} explicitly asked you to save this memory as written. It skips the check that turns away work logs and wording that needs this chat to make sense.")),
   });
 
   server.registerTool("remember", {
     title: "Remember",
-    description: t("Save one durable memory (fact, preference, decision and its reason, correction, project state). Recall first. If it updates an existing memory, pass `supersedes`. In review mode the memory is stored as 'proposed' until {owner} approves it, so say 'proposed' rather than 'saved'; in auto mode it is active right away, and a superseding write replaces the old memory. Content (or source) that looks like a secret is rejected. Exact duplicates return the existing id, but `supersedes` is still applied: if the winning wording already exists, it replaces the old memory (after approval in review mode). Restating wording that was superseded earlier makes it current again."),
+    description: t("Save one durable memory (fact, preference, decision and its reason, correction, project state). Recall first. " +
+      "Save what {owner} told you or decided, not what you did: it must make sense weeks from now in another app, so name the subject and use calendar dates. " +
+      "Good: \"{Owner} chose SQLite over Postgres for the recipe app (2026-10-12) because it needs no server.\" \"{Owner} prefers short answers without bullet lists in chat.\" \"As of 2026-10-20, the recipe app's import is live but sharing is unfinished.\" " +
+      "Not stored: \"Ran the tests: all 120 pass.\" \"Committed 4f2a91c and deployed.\" \"Next step: update the README.\" \"He prefers dark mode.\" \"Yesterday we decided to use Postgres.\" " +
+      "Such memories come back with status 'not_stored' and the reason: fix them and call again, or skip them; pass owner_requested only when {owner} asked for that exact memory. " +
+      "If it updates an existing memory, pass `supersedes`. In review mode the memory is stored as 'proposed' until {owner} approves it, so say 'proposed' rather than 'saved'; in auto mode it is active right away, and a superseding write replaces the old memory. Content (or source) that looks like a secret is rejected. Exact duplicates return the existing id, but `supersedes` is still applied: if the winning wording already exists, it replaces the old memory (after approval in review mode). Restating wording that was superseded earlier makes it current again."),
     inputSchema: rememberShape,
   }, async (a) => json(await vault.remember({ ...a, source: src(a.source), actor })));
 
