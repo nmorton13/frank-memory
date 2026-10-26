@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { fillOwner, MAX_CONTENT_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MEMORY_STATUSES, MEMORY_TYPES, slimMemory } from "./helpers";
+import { fillOwner, MAX_CONTENT_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MEMORY_STATUSES, MEMORY_TYPES, slimMemory, withClient } from "./helpers";
 import type { MemoryVault } from "./vault";
 
 type Vault = DurableObjectStub<MemoryVault>;
@@ -19,7 +19,7 @@ export function buildMcpServer(vault: Vault, caller: McpCaller = {}) {
   const client = caller.client;
   const t = (s: string) => fillOwner(s, caller.ownerName);
   const actor = client ? `mcp:${client}` : "mcp";
-  const src = (s?: string) => (client ? (s ? `${s} (via ${client})` : `via ${client}`) : s);
+  const src = (s?: string) => withClient(s, client);
   const server = new McpServer(
     { name: "frank-memory", version: "0.2.0" },
     {

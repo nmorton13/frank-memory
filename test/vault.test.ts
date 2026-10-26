@@ -1315,3 +1315,14 @@ describe("write-time quality check", () => {
     expect(await h.vault.remember({ content: "Sam's cat is named Miso.", actor: "mcp:Claude" })).toMatchObject({ ok: true });
   });
 });
+
+describe("v11 migration: repeated (via App) suffixes", () => {
+  it("cuts a repeated suffix to one and leaves different apps alone", async () => {
+    const old = createVault({ approvalMode: "auto" });
+    const a = await old.vault.remember({ content: "Sam uses Vim.", source: "claude-code: repo x (via Claude Code) (via Claude Code)", actor: "ui" });
+    const b = await old.vault.remember({ content: "Sam uses Zsh.", source: "Hermes memory (via Hermes Agent) (via Claude Code)", actor: "ui" });
+    const h = createVault({ db: old.db });
+    expect(await h.vault.getMemory(a.id as string)).toMatchObject({ source: "claude-code: repo x (via Claude Code)" });
+    expect(await h.vault.getMemory(b.id as string)).toMatchObject({ source: "Hermes memory (via Hermes Agent) (via Claude Code)" });
+  });
+});

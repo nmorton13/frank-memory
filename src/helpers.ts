@@ -170,6 +170,22 @@ export function repoFromSource(source: string | null | undefined): string | null
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** A source with each run of the same " (via App)" suffix cut to one: "x (via Cursor) (via Cursor)" -> "x (via Cursor)". */
+export function collapseVia(source: string): string {
+  return source.replace(/( \(via ([^()]+)\))(?: \(via \2\))+/g, "$1");
+}
+
+/**
+ * A source tagged with the app that wrote it, once. Agents often pass back the source of a memory they recalled,
+ * suffix included, which used to store "(via Claude Code) (via Claude Code)".
+ */
+export function withClient(source: string | undefined, client: string | undefined): string | undefined {
+  if (!client) return source;
+  if (!source) return `via ${client}`;
+  const s = collapseVia(source.trim());
+  return s === `via ${client}` || s.endsWith(`(via ${client})`) ? s : `${s} (via ${client})`;
+}
+
 /** Areas whose name or an alias appears in the text as a whole word; "frank-memory" also matches "frank memory". */
 export function areasNamedIn(text: string, areas: AreaDef[]): string[] {
   const found: string[] = [];

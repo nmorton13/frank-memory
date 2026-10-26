@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   bestMatch, classifySimilarity, contentHash, fillOwner, listIncludes, intParam, looksLikeSecret, meaningTokens, NEAR_DUP_SIM, parseRetentionDays, retentionCutoff,
   keywordStrengths, sanitizeFtsQuery, scoreRecallHit, SIMILAR_SIM, slimMemory, splitImportText, unitVector, withTimeout,
-  areasNamedIn, chatText, namesNoOne, normalizeArea, parseAreaNames, parseQuality, pickArea, qualityPrompt, repoFromSource,
+  areasNamedIn, chatText, namesNoOne, normalizeArea, parseAreaNames, parseQuality, pickArea, qualityPrompt, repoFromSource, withClient,
 } from "../src/helpers";
 
 describe("splitImportText", () => {
@@ -354,5 +354,17 @@ describe("quality check", () => {
     expect(namesNoOne("He is Sam's brother.")).toBe(false);
     expect(namesNoOne("Help desk roles are out.")).toBe(false);
     expect(namesNoOne("Sam prefers dark mode.")).toBe(false);
+  });
+});
+
+describe("withClient", () => {
+  it("tags a source with the app once, even when the agent passes back a tagged source", () => {
+    expect(withClient("cursor: repo x", "Cursor")).toBe("cursor: repo x (via Cursor)");
+    expect(withClient("cursor: repo x (via Cursor)", "Cursor")).toBe("cursor: repo x (via Cursor)");
+    expect(withClient("cursor: repo x (via Cursor) (via Cursor)", "Cursor")).toBe("cursor: repo x (via Cursor)");
+    expect(withClient("Hermes memory (via Hermes Agent)", "Claude Code")).toBe("Hermes memory (via Hermes Agent) (via Claude Code)");
+    expect(withClient(undefined, "Cursor")).toBe("via Cursor");
+    expect(withClient("via Cursor", "Cursor")).toBe("via Cursor");
+    expect(withClient("x", undefined)).toBe("x");
   });
 });

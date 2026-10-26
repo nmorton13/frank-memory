@@ -7,7 +7,7 @@ import {
   keywordStrengths, looksLikeSecret, MAX_CONTENT_LEN, MAX_GUIDE_LEN, MAX_IMPORT_ITEMS, MAX_IMPORT_TEXT, MemoryStatus, metadataProblem, MemoryType, MIN_SEMANTIC_SIM, parseRetentionDays, Retention, RETENTION_DEFAULTS, RETENTION_KEYS,
   retentionCutoff, sanitizeFtsQuery, scoreRecallHit, slimMemory, splitImportText, TYPE_ORDER,
   AREA_ALIAS_SIM, AREA_ALL_BUDGET_TOKENS, AREA_ALL_MAX_MEMORIES, AREA_BONUS, AREA_MIN_MEMORIES, AREA_MODEL, AreaDef, areaDescriptionPrompt, areaLabelPrompt, areasNamedIn,
-  fillOwner, namesNoOne, parseQuality, QUALITY_MODEL, QUALITY_TIMEOUT_MS, qualityPrompt,
+  collapseVia, fillOwner, namesNoOne, parseQuality, QUALITY_MODEL, QUALITY_TIMEOUT_MS, qualityPrompt,
   CLEF_MAX, CLEF_MIN_CONFLICT, CLEF_MIN_RELEVANCE, CLEF_MODEL, CLEF_SEMANTIC_CANDIDATES, CLEF_TIMEOUT_MS, conflictQuestion, relevanceQuestion,
   aliasOf, areaConfirmPrompt, areaPreferencePrompt, chatText, cleanMerged, isNothingMissing, isYes, lostDetails, MERGE_MIN_SIM, MERGE_MODEL, mergeCheckPrompt, mergePrompt, sameFactPrompt, GENERAL_ALL_BUDGET_TOKENS, closestArea, dominantArea, GENERAL_PREFS_BUDGET_TOKENS, GENERAL_PREFS_MAX_MEMORIES, normalizeArea, parseAreaNames, pickArea, resolveArea, unitVector, VECTORIZE_TIMEOUT_MS, withTimeout,
 } from "./helpers";
@@ -173,6 +173,11 @@ export class MemoryVault extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS merge_jobs (memory_id TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL, last_error TEXT)`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS merge_checked (pair TEXT PRIMARY KEY, checked_at TEXT NOT NULL)`);
+    // v11: sources that got the same "(via App)" suffix twice (an agent passed back a recalled source) are cut to one.
+    for (const r of this.sql.exec(`SELECT id, source FROM memories WHERE source LIKE '%(via %(via %'`).toArray()) {
+      const fixed = collapseVia(r.source as string);
+      if (fixed !== r.source) this.sql.exec(`UPDATE memories SET source = ? WHERE id = ?`, fixed, r.id);
+    }
     if (addAreas) this.relabelAreas("backfill");
     // v8: labels from an area named in the text are no longer a rule; those memories go to the model instead.
     const named = this.sql.exec(`SELECT id FROM memories WHERE area_source = 'content'`).toArray();
