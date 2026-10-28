@@ -13,17 +13,17 @@
   "author": "Nathan Morton",
   "license": "MIT",
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "^1.2.3",
-    "@modelcontextprotocol/server": "2.3.1",
-    "agents": "^0.28.1",
-    "jose": "6.2.12",
+    "@cloudflare/workers-oauth-provider": "^1.2.4",
+    "@modelcontextprotocol/server": "2.4.0",
+    "agents": "^0.30.1",
+    "jose": "6.2.13",
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261013.1",
+    "@cloudflare/workers-types": "^5.20261025.1",
     "typescript": "^5.9.3",
     "vitest": "^5.0.5",
-    "wrangler": "^4.151.3"
+    "wrangler": "^4.152.0"
   },
   "private": true,
   "type": "module"
